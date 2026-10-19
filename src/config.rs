@@ -27,17 +27,24 @@ pub struct Config {
     /// How long an idle `claude` process is kept warm before it is reaped
     /// (ignored when `claude_keep_warm` is on).
     pub claude_idle: Duration,
-    /// Hard cap on simultaneously live `claude` processes across all projects.
-    /// Prompts beyond the cap wait in a FIFO queue.
-    pub claude_max_live: usize,
+    /// Cap on simultaneously live `claude` processes across all projects: a
+    /// number, or `auto` to follow the machine (capacity.rs). Prompts beyond
+    /// the cap wait in a FIFO queue.
+    pub claude_max_live: crate::capacity::Mode,
     /// Never reap the idle `claude` process, and pre-start one for the most
     /// recently used Claude agent so the next prompt skips the cold start.
     pub claude_keep_warm: bool,
     /// How long the shared `codex app-server` stays up with no active turns
     /// (ignored when `codex_keep_warm` is on).
     pub codex_idle: Duration,
-    /// Max Codex turns running at once across all projects; the rest queue.
-    pub codex_max_active: usize,
+    /// Max Codex turns running at once across all projects (a number or
+    /// `auto`); the rest queue.
+    pub codex_max_active: crate::capacity::Mode,
+    /// Auto capacity: memory budgeted per agent (MB), the most agents it may
+    /// run at once, and how long the machine must stay calm before one more.
+    pub agent_mb: u64,
+    pub auto_max_agents: usize,
+    pub auto_stable: Duration,
     /// Start the shared `codex app-server` with the daemon and keep it up,
     /// restarting it if it exits.
     pub codex_keep_warm: bool,
@@ -132,10 +139,13 @@ impl Config {
             claude_bin: env("PASEO_CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
             codex_bin: env("PASEO_CODEX_BIN").unwrap_or_else(|| "codex".into()),
             claude_idle: env_secs("PASEO_CLAUDE_IDLE_SECS", 90),
-            claude_max_live: env("PASEO_CLAUDE_MAX_LIVE").and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            claude_max_live: crate::capacity::Mode::parse(env("PASEO_CLAUDE_MAX_LIVE").as_deref()),
             claude_keep_warm: env_bool("PASEO_CLAUDE_KEEP_WARM").unwrap_or(true),
             codex_idle: env_secs("PASEO_CODEX_IDLE_SECS", 300),
-            codex_max_active: env("PASEO_CODEX_MAX_ACTIVE").and_then(|v| v.parse().ok()).unwrap_or(1).max(1),
+            codex_max_active: crate::capacity::Mode::parse(env("PASEO_CODEX_MAX_ACTIVE").as_deref()),
+            agent_mb: env("PASEO_AGENT_MB").and_then(|v| v.parse().ok()).unwrap_or(300).max(50),
+            auto_max_agents: env("PASEO_AUTO_MAX_AGENTS").and_then(|v| v.parse().ok()).unwrap_or(8).max(1),
+            auto_stable: env_secs("PASEO_AUTO_STABLE_SECS", 60),
             codex_keep_warm: env_bool("PASEO_CODEX_KEEP_WARM").unwrap_or(true),
             agent_nice: env("PASEO_AGENT_NICE").and_then(|v| v.parse().ok()).unwrap_or(10).clamp(0, 19),
             agent_oom_score_adj: env("PASEO_AGENT_OOM_SCORE_ADJ").and_then(|v| v.parse().ok()).unwrap_or(500).clamp(0, 1000),

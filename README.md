@@ -11,9 +11,10 @@ so you can pair it with the Paseo apps exactly like the Node daemon.
 |---|---|---|
 | Daemon runtime | Node.js, multi-package | one static Rust binary, single-threaded tokio runtime |
 | Codex | one `codex app-server` **per agent**, plus throwaway ones for model listing | **one shared** `codex app-server` for every agent in every project; threads are routed by `threadId`, each with its own `cwd`; the model list is cached on disk |
-| Claude Code | one long-lived `claude` child per agent | **one shared** `claude` process (`PASEO_CLAUDE_MAX_LIVE`); a process is bound to one session and `cwd`, so switching agents replaces it (`--resume`) |
+| Claude Code | one long-lived `claude` child per agent | **one shared** `claude` process (more when the machine allows, see below); a process is bound to one session and `cwd`, so switching agents replaces it (`--resume`) |
 | One CLI at a time | both run freely | only one CLI has a process at any time. All turns from every project and both providers share one FIFO queue. The active CLI stays warm (pre-started at launch for the last used provider). When the next queued turn needs the other CLI, it waits for running turns to finish, the active CLI is shut down, and the other one cold-starts and stays warm until the next switch. Codex model listing never starts Codex while Claude Code is active |
 | Queued messages | each waits for its own turn | messages sent to a chat while it is busy are combined into **one** turn when the current one finishes (same conversation, one round trip, the context is sent once). Each still shows as its own bubble; slash commands always run on their own |
+| Agents at once | each agent runs freely | `auto` by default: one turn at a time to start, and the shared queue adds another worker once turns are waiting and the machine has stayed calm for `PASEO_AUTO_STABLE_SECS` (low memory and CPU pressure, room for one more agent). It drops one again when memory or CPU pressure builds up; running turns are never stopped, and spare warm processes are released. The ceiling is what the memory limit (the container's cgroup, else the host) fits at `PASEO_AGENT_MB` per agent, twice the CPU count, and `PASEO_AUTO_MAX_AGENTS`; on a 1 GB VM that stays at one. A number in `PASEO_CLAUDE_MAX_LIVE` / `PASEO_CODEX_MAX_ACTIVE` fixes the cap instead |
 | Images and files | inline images and uploaded files | same protocol: images sent with a message and files uploaded through `file.upload` (binary frames, up to 100 MB) are saved under `~/.paseo-lite/uploads` (kept 14 days). The agent is told each file's path; images are also given to the model as images (Claude image blocks, Codex local images) |
 | Usage | plan limit windows from provider plugins | tokens and cost **per provider and model**, booked from the CLIs' own totals (Claude Code `modelUsage` incl. its USD cost; Codex `tokenUsage`, priced from LiteLLM's public price list, refreshed daily). Shown in the app's Usage screen: cost today / 7 / 30 days / all time, tokens, the in/cached/out split, the top models, the 30-day daily average, a 30-day projection, the prompt cache hit rate and each of the last 30 days, plus one card per model with its cost and tokens over 7 / 30 days and all time, the token split and the effective cost per 1M tokens; an agent's view adds its own spend. Costs are API list prices (what the tokens would cost through the API), not subscription billing. Days are UTC; kept in `~/.paseo-lite/usage.json` |
 | Usage limits | the turn fails; you send it again after the reset | the turn **waits** for the Claude / Codex usage limit to reset (time read from Claude's rate-limit event or Codex's rate-limit windows), then continues on its own and runs anything queued meanwhile; the chat says when. Sending a message tries again at once; stop cancels (`PASEO_RESUME_AFTER_LIMIT`) |
@@ -111,11 +112,14 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_RELAY_USE_TLS` | `true` for `:443` | `wss` vs `ws` |
 | `PASEO_RELAY_PUBLIC_ENDPOINT` / `_USE_TLS` | same as above | what goes into the pairing offer |
 | `PASEO_APP_BASE_URL` | `https://app.paseo.sh` | pairing link base |
-| `PASEO_CLAUDE_MAX_LIVE` | `1` | max concurrent `claude` processes; extra prompts queue |
+| `PASEO_CLAUDE_MAX_LIVE` | `auto` | max concurrent `claude` processes, or `auto` to follow the machine; extra prompts queue |
 | `PASEO_CLAUDE_KEEP_WARM` | `true` | keep the `claude` process warm and pre-start it |
 | `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off) |
 | `PASEO_CODEX_IDLE_SECS` | `300` | idle time before the shared app-server exits (when keep-warm is off) |
-| `PASEO_CODEX_MAX_ACTIVE` | `1` | max concurrent Codex turns; extra prompts queue |
+| `PASEO_CODEX_MAX_ACTIVE` | `auto` | max concurrent Codex turns, or `auto`; extra prompts queue |
+| `PASEO_AGENT_MB` | `300` | `auto`: memory budgeted per agent, for the ceiling and the room check |
+| `PASEO_AUTO_MAX_AGENTS` | `8` | `auto`: never more agents at once than this |
+| `PASEO_AUTO_STABLE_SECS` | `60` | `auto`: how long the machine must stay calm, with turns waiting, before adding a worker |
 | `PASEO_CODEX_KEEP_WARM` | `true` | start the app-server with the daemon and keep it up |
 | `PASEO_AGENT_NICE` | `10` | CPU niceness of `claude` / `codex` and everything they run (0 = off) |
 | `PASEO_AGENT_OOM_SCORE_ADJ` | `500` | OOM score for agent processes, so the kernel kills them before the daemon (0 = off) |

@@ -132,6 +132,9 @@ pub struct Manager {
     /// Turns (agentId, prompt) waiting for the CLI, across all projects and
     /// both providers, strictly first come first served.
     pub cli_queue: VecDeque<(String, String)>,
+    /// How many turns may run at once when a cap is `auto` (None when both
+    /// caps are fixed numbers).
+    pub capacity: Option<crate::capacity::Capacity>,
     claude_warm_at: Option<Instant>,
     codex_warm_at: Option<Instant>,
     pub bcast: broadcast::Sender<Arc<str>>,
@@ -206,9 +209,14 @@ impl Manager {
             crate::snapshot::set_project_name(&p.root_path, p.custom_name.as_deref());
         }
         crate::log!("loaded {} agents, {} projects, {} workspaces", agents.len(), projects.len(), workspaces.len());
-        let claude = ClaudePool::new(cfg.clone(), events_tx.clone());
+        let mut claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
-        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, chunks: HashMap::new(), chunk_deadline: None };
+        let auto = [cfg.claude_max_live, cfg.codex_max_active].contains(&crate::capacity::Mode::Auto);
+        let capacity = auto.then(|| crate::capacity::Capacity::new(cfg.agent_mb, cfg.auto_max_agents, cfg.auto_stable));
+        if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
+            claude.set_max_live(n);
+        }
+        let mut manager = Manager { cfg, server_id, store, agents, claude, codex, active_cli: None, running: HashSet::new(), cli_queue: VecDeque::new(), capacity, claude_warm_at: None, codex_warm_at: None, bcast, events_tx, agents_dirty: false, pairing_url, projects, workspaces, cmds_tx, checkout: crate::checkout::Watcher::start(), started_at: now_iso(), waiters: Vec::new(), push_tokens, clients: Vec::new(), daemon_config, usage, chunks: HashMap::new(), chunk_deadline: None };
         manager.migrate_agent_workspaces();
         (manager, events_rx)
     }
@@ -267,6 +275,7 @@ impl Manager {
     fn housekeeping(&mut self) {
         self.claude.reap();
         self.codex.reap();
+        self.update_capacity();
         self.keep_warm();
         self.run_retries_and_watchdog();
         self.flush_all();
@@ -606,8 +615,7 @@ impl Manager {
                 }
                 self.switch_cli(cli, &id);
             }
-            let cap = if cli == "codex" { self.cfg.codex_max_active } else { self.cfg.claude_max_live };
-            if self.running.len() >= cap {
+            if self.running.len() >= self.slots(cli) {
                 break;
             }
             let Some((id, text)) = self.cli_queue.pop_front() else { break };
@@ -617,6 +625,45 @@ impl Manager {
                 self.run_codex(spec, text);
             } else if let SendOutcome::Failed(error) = self.claude.send(spec, text) {
                 self.finish_turn(&id, Err(error));
+            }
+        }
+    }
+
+    /// How many turns `cli` may run at once: its fixed cap, or what the
+    /// machine allows right now.
+    pub fn slots(&self, cli: &str) -> usize {
+        let mode = if cli == "codex" { self.cfg.codex_max_active } else { self.cfg.claude_max_live };
+        match (mode, &self.capacity) {
+            (crate::capacity::Mode::Fixed(n), _) => n,
+            (crate::capacity::Mode::Auto, Some(cap)) => cap.limit(),
+            (crate::capacity::Mode::Auto, None) => 1,
+        }
+    }
+
+    /// Auto capacity: read the machine, let the Claude pool keep as many
+    /// processes as the new limit allows, and start queued turns when it
+    /// went up. Runs every tick.
+    fn update_capacity(&mut self) {
+        let queued = self.cli_queue.len() + self.claude.waiting_count();
+        let running = self.running.len();
+        let Some(cap) = self.capacity.as_mut() else { return };
+        let grew = cap.update(running, queued);
+        let max = self.slots("claude");
+        if max != self.claude.max_live() {
+            let ready = self.claude.set_max_live(max);
+            self.send_ready(ready);
+        }
+        if grew {
+            self.pump();
+        }
+    }
+
+    /// Start Claude prompts the pool released from its waiting list.
+    fn send_ready(&mut self, ready: Vec<(AgentSpec, String)>) {
+        for (spec, text) in ready {
+            let id = spec.id.clone();
+            if let SendOutcome::Failed(e) = self.claude.send(spec, text) {
+                self.finish_turn(&id, Err(e));
             }
         }
     }
@@ -808,12 +855,8 @@ impl Manager {
         self.running.remove(agent_id);
         self.cli_queue.retain(|(id, _)| id != agent_id);
         if provider == "claude" {
-            for (spec, text) in self.claude.turn_finished(agent_id) {
-                let id = spec.id.clone();
-                if let SendOutcome::Failed(e) = self.claude.send(spec, text) {
-                    self.finish_turn(&id, Err(e));
-                }
-            }
+            let ready = self.claude.turn_finished(agent_id);
+            self.send_ready(ready);
         }
         self.pump();
         if !compacting && matches!(outcome, Ok(None)) && self.needs_compaction(agent_id) {
@@ -1174,12 +1217,7 @@ impl Manager {
                 let failed = current && self.agents.get(&agent_id).map(|a| a.status == "running").unwrap_or(false) && !queued;
                 // Start the prompts that were waiting on this slot before
                 // finish_turn drains the pool again, so they keep their order.
-                for (spec, text) in ready {
-                    let id = spec.id.clone();
-                    if let SendOutcome::Failed(e) = self.claude.send(spec, text) {
-                        self.finish_turn(&id, Err(e));
-                    }
-                }
+                self.send_ready(ready);
                 if failed {
                     self.finish_turn(&agent_id, Err("claude exited unexpectedly".into()));
                 }

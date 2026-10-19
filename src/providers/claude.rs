@@ -5,9 +5,10 @@
 //! - spawned on the first prompt (with `--resume` when the session exists),
 //! - kept warm for `claude_idle` after a turn so follow-ups are instant,
 //! - then its stdin is closed and it exits, freeing all of its memory.
-//! At most `claude_max_live` children run at once across all projects (one by
-//! default). When the cap is hit the oldest idle child is evicted, or the
-//! prompt waits in a FIFO queue until a running turn finishes.
+//! At most `max_live` children run at once across all projects: the fixed
+//! `claude_max_live`, or the manager's auto capacity (one on a small machine).
+//! When the cap is hit the oldest idle child is evicted, or the prompt waits
+//! in a FIFO queue until a running turn finishes.
 //! With `claude_keep_warm` the idle child is never reaped, and the manager
 //! pre-starts one (`prewarm`) so the next prompt skips the cold start.
 
@@ -47,15 +48,29 @@ pub struct ClaudePool {
     procs: HashMap<String, Proc>,
     waiting: VecDeque<(AgentSpec, String)>,
     generation: u64,
+    max_live: usize,
 }
 
 impl ClaudePool {
     pub fn new(cfg: Config, events: EventTx) -> Self {
-        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0 }
+        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1 }
     }
 
     pub fn live_count(&self) -> usize {
         self.procs.len()
+    }
+
+    pub fn max_live(&self) -> usize {
+        self.max_live
+    }
+
+    /// Change the process cap. Lowering it stops warm idle processes above
+    /// the new cap (busy ones finish their turn first); raising it returns
+    /// waiting prompts that may start now.
+    pub fn set_max_live(&mut self, max: usize) -> Vec<(AgentSpec, String)> {
+        self.max_live = max.max(1);
+        while self.procs.len() > self.max_live && self.evict_one_idle() {}
+        self.drain_waiting()
     }
 
     /// Prompts waiting for a free slot.
@@ -110,7 +125,7 @@ impl ClaudePool {
             }
             self.procs.remove(&spec.id);
         }
-        if self.procs.len() >= self.cfg.claude_max_live && !self.evict_one_idle() {
+        if self.procs.len() >= self.max_live && !self.evict_one_idle() {
             self.waiting.push_back((spec, text));
             return SendOutcome::Queued;
         }
@@ -272,7 +287,7 @@ impl ClaudePool {
     }
 
     fn drain_waiting(&mut self) -> Vec<(AgentSpec, String)> {
-        let mut free = self.cfg.claude_max_live.saturating_sub(self.procs.len());
+        let mut free = self.max_live.saturating_sub(self.procs.len());
         // Make room for one waiting prompt by evicting a warm-but-idle process.
         if free == 0 && !self.waiting.is_empty() && self.evict_one_idle() {
             free = 1;
