@@ -218,6 +218,9 @@ impl Codex {
 
     /// Start a turn for an agent; thread creation/resume happens on demand.
     pub async fn run_turn(&self, spec: AgentSpec, text: String) -> Result<(), String> {
+        if crate::edge::route(&self.inner.cfg.edges_dir, &spec.cwd).is_some() {
+            return Err("Codex agents cannot run on edge machines yet; use a Claude agent for this folder".into());
+        }
         self.ensure_started().await?;
         let mode = spec.mode_id.clone().unwrap_or_else(|| "auto".into());
         let (approval, sandbox, sandbox_policy) = policies(&mode);

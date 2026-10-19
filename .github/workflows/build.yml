@@ -50,7 +50,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Integration tests
-        run: cargo test --test e2e -- --test-threads=4
+        run: cargo test --test e2e --test edge -- --test-threads=4
 
   # Static musl binaries for the Docker image (Alpine), one per architecture,
   # built natively on matching runners (no cross toolchain or QEMU).

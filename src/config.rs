@@ -84,6 +84,9 @@ pub struct Config {
     /// Instructions added to every agent; `PASEO_DEFAULT_SYSTEM_PROMPT` overrides
     /// it, and setting it to an empty string disables it.
     pub default_system_prompt: Option<String>,
+    /// Where edge machines' folders appear on main (`PASEO_EDGES_DIR`): an agent
+    /// whose folder is under `<edges_dir>/<edge>/` runs on that edge.
+    pub edges_dir: PathBuf,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -124,7 +127,6 @@ impl Config {
         let relay_public_endpoint = env("PASEO_RELAY_PUBLIC_ENDPOINT").unwrap_or_else(|| relay_endpoint.clone());
         let relay_public_use_tls = env_bool("PASEO_RELAY_PUBLIC_USE_TLS").unwrap_or(relay_use_tls);
         Config {
-            home,
             listen,
             password: env("PASEO_PASSWORD"),
             relay_enabled,
@@ -165,6 +167,8 @@ impl Config {
                 Ok(v) => Some(v),
                 Err(_) => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             },
+            edges_dir: env("PASEO_EDGES_DIR").map(PathBuf::from).unwrap_or_else(|| crate::edge::hub::default_edges_dir(&home)),
+            home,
         }
     }
 }

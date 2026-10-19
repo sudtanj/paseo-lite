@@ -34,6 +34,8 @@ struct Proc {
     interrupted: Arc<AtomicBool>,
     /// Spawn flags (model, effort) changed mid-turn: restart once the turn ends.
     restart: bool,
+    /// Runs on an edge machine: does not take one of this machine's slots.
+    remote: bool,
 }
 
 pub enum SendOutcome {
@@ -60,6 +62,11 @@ impl ClaudePool {
         self.procs.len()
     }
 
+    /// Processes on this machine (the cap does not count edge machines').
+    fn local_count(&self) -> usize {
+        self.procs.values().filter(|p| !p.remote).count()
+    }
+
     pub fn max_live(&self) -> usize {
         self.max_live
     }
@@ -69,7 +76,7 @@ impl ClaudePool {
     /// waiting prompts that may start now.
     pub fn set_max_live(&mut self, max: usize) -> Vec<(AgentSpec, String)> {
         self.max_live = max.max(1);
-        while self.procs.len() > self.max_live && self.evict_one_idle() {}
+        while self.local_count() > self.max_live && self.evict_one_idle() {}
         self.drain_waiting()
     }
 
@@ -125,7 +132,9 @@ impl ClaudePool {
             }
             self.procs.remove(&spec.id);
         }
-        if self.procs.len() >= self.max_live && !self.evict_one_idle() {
+        // Edge agents use the edge's CPU and memory, not a slot here.
+        let remote = crate::edge::route(&self.cfg.edges_dir, &spec.cwd).is_some();
+        if !remote && self.local_count() >= self.max_live && !self.evict_one_idle() {
             self.waiting.push_back((spec, text));
             return SendOutcome::Queued;
         }
@@ -150,7 +159,7 @@ impl ClaudePool {
     }
 
     fn evict_one_idle(&mut self) -> bool {
-        let victim = self.procs.iter().filter(|(_, p)| !p.busy).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
+        let victim = self.procs.iter().filter(|(_, p)| !p.busy && !p.remote).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
         match victim {
             Some(id) => {
                 self.stop(&id);
@@ -163,35 +172,43 @@ impl ClaudePool {
     fn spawn(&mut self, spec: &AgentSpec) -> Result<(), String> {
         self.generation += 1;
         let generation = self.generation;
-        let mut cmd = Command::new(&self.cfg.claude_bin);
-        cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompt-tool", "stdio"]);
-        cmd.args(["--permission-mode", spec.mode_id.as_deref().unwrap_or("default")]);
+        let mut args: Vec<String> = ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompt-tool", "stdio"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        args.extend(["--permission-mode".to_string(), spec.mode_id.clone().unwrap_or_else(|| "default".into())]);
         if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty() && *m != "default") {
-            cmd.args(["--model", model]);
+            args.extend(["--model".to_string(), model.to_string()]);
         }
         let session_id = match &spec.session_id {
             Some(sid) => {
-                cmd.args(["--resume", sid.as_str()]);
+                args.extend(["--resume".to_string(), sid.clone()]);
                 sid.clone()
             }
             None => {
                 let sid = crate::util::new_id();
-                cmd.args(["--session-id", sid.as_str()]);
+                args.extend(["--session-id".to_string(), sid.clone()]);
                 sid
             }
         };
         if let Some(effort) = spec.thinking.as_deref().filter(|e| !e.is_empty() && *e != "default") {
-            cmd.args(["--effort", effort]);
+            args.extend(["--effort".to_string(), effort.to_string()]);
         }
         if let Some(prompt) = spec.system_prompt.as_deref().filter(|p| !p.is_empty()) {
-            cmd.args(["--append-system-prompt", prompt]);
+            args.extend(["--append-system-prompt".to_string(), prompt.to_string()]);
         }
         // Skip telemetry, error reporting and update checks: they only cost
         // egress here (the binary is pinned in the image). Set it in the
         // daemon's environment to override.
+        let mut envs: Vec<(String, String)> = Vec::new();
         if std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_none() {
-            cmd.env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+            envs.push(("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(), "1".into()));
         }
+        if let Some(target) = crate::edge::route(&self.cfg.edges_dir, &spec.cwd) {
+            return self.spawn_remote(spec, target?, args, envs, session_id, generation);
+        }
+        let mut cmd = Command::new(&self.cfg.claude_bin);
+        cmd.args(&args).envs(envs);
         cmd.current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         super::deprioritize(&mut cmd, &self.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.cfg.claude_bin))?;
@@ -266,7 +283,51 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, restart: false });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, restart: false, remote: false });
+        Ok(())
+    }
+
+    /// The same process on an edge machine: its lines cross the relay, and
+    /// the rest (stream parsing, permissions, events) is unchanged.
+    fn spawn_remote(&mut self, spec: &AgentSpec, target: crate::edge::Target, args: Vec<String>, envs: Vec<(String, String)>, session_id: String, generation: u64) -> Result<(), String> {
+        let remote = crate::edge::hub::spawn(&target, "claude", &args, &envs)?;
+        crate::log!("claude started for agent {} on edge {}", spec.id, target.edge);
+        let in_tx = remote.stdin;
+        let (kill_tx, kill_rx) = oneshot::channel::<()>();
+        let interrupted = Arc::new(AtomicBool::new(false));
+        if spec.session_id.is_none() {
+            let _ = self.events.send(ProviderEvent::SessionStarted { agent_id: spec.id.clone(), session_id: session_id.clone() });
+        }
+        let init = json!({ "type": "control_request", "request_id": format!("init-{generation}"), "request": { "subtype": "initialize", "hooks": null } });
+        let _ = in_tx.send(init.to_string());
+
+        let mut state = StreamState::new(spec.id.clone(), self.events.clone(), in_tx.clone(), interrupted.clone(), Some(session_id));
+        let events = self.events.clone();
+        let agent_id = spec.id.clone();
+        let (mut stdout, exit, kill) = (remote.stdout, remote.exit, remote.kill);
+        let edge = target.edge;
+        tokio::spawn(async move {
+            let mut kill_rx = kill_rx;
+            loop {
+                tokio::select! {
+                    line = stdout.recv() => match line {
+                        Some(line) => state.handle_line(&line),
+                        None => break,
+                    },
+                    _ = &mut kill_rx => {
+                        kill.kill();
+                        break;
+                    }
+                }
+            }
+            let exit = exit.await.unwrap_or(crate::edge::hub::Exit { ok: false, detail: "edge machine disconnected".into() });
+            if !exit.ok && !exit.detail.is_empty() {
+                crate::warn!("claude for {agent_id} on edge {edge} exited: {}", crate::util::truncate(&exit.detail, 400));
+            }
+            let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
+        });
+
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, restart: false, remote: true });
         Ok(())
     }
 
@@ -296,7 +357,7 @@ impl ClaudePool {
     }
 
     fn drain_waiting(&mut self) -> Vec<(AgentSpec, String)> {
-        let mut free = self.max_live.saturating_sub(self.procs.len());
+        let mut free = self.max_live.saturating_sub(self.local_count());
         // Make room for one waiting prompt by evicting a warm-but-idle process.
         if free == 0 && !self.waiting.is_empty() && self.evict_one_idle() {
             free = 1;

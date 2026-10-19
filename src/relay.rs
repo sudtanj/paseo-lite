@@ -8,6 +8,8 @@
 use crate::config::Config;
 use crate::e2ee::{Channel, DaemonIdentity};
 use crate::session::{self, Ctx, Inbound};
+use std::future::Future;
+use std::pin::Pin;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -49,11 +51,11 @@ fn tls_connector() -> tokio_tungstenite::Connector {
     tokio_tungstenite::Connector::Rustls(tls_config())
 }
 
-type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+pub(crate) type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Open a relay socket with Nagle disabled (small JSON frames go out
 /// immediately instead of waiting up to 40ms for an ACK) and the shared TLS config.
-async fn connect(target: &str, timeout: Duration) -> Result<Ws, String> {
+pub(crate) async fn connect(target: &str, timeout: Duration) -> Result<Ws, String> {
     let fut = tokio_tungstenite::connect_async_tls_with_config(target, None, true, Some(tls_connector()));
     let (ws, _) = tokio::time::timeout(timeout, fut).await.map_err(|_| "connect timeout".to_string())?.map_err(|e| e.to_string())?;
     Ok(ws)
@@ -79,13 +81,28 @@ fn url(cfg: &Config, server_id: &str, connection_id: Option<&str>) -> String {
 
 type DataSockets = Arc<Mutex<HashMap<String, JoinHandle<()>>>>;
 
+/// What runs one decrypted client connection: plaintext frames in, frames
+/// out, and the client's public key (already proven by the E2EE handshake).
+pub type Handler = Arc<dyn Fn(tokio::sync::mpsc::Receiver<Inbound>, tokio::sync::mpsc::Sender<Arc<str>>, String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// The app's relay identity: every connection is an app session.
 pub async fn run(ctx: Arc<Ctx>, cfg: Config, identity: Arc<DaemonIdentity>) {
+    let handler: Handler = Arc::new(
+        move |inbound: tokio::sync::mpsc::Receiver<Inbound>, outbound: tokio::sync::mpsc::Sender<Arc<str>>, _peer_key: String| -> Pin<Box<dyn Future<Output = ()> + Send>> {
+            Box::pin(session::run(ctx.clone(), inbound, outbound, true))
+        },
+    );
+    run_with(handler, cfg, identity).await
+}
+
+/// Serve one relay identity, handing each client connection to `handler`.
+pub async fn run_with(handler: Handler, cfg: Config, identity: Arc<DaemonIdentity>) {
     let data: DataSockets = Arc::new(Mutex::new(HashMap::new()));
     let mut backoff = Duration::ZERO;
     loop {
         let mut connected = false;
         let started = Instant::now();
-        let err = control_session(&ctx, &cfg, &identity, &data, &mut connected).await.err().unwrap_or_else(|| "closed".into());
+        let err = control_session(&handler, &cfg, &identity, &data, &mut connected).await.err().unwrap_or_else(|| "closed".into());
         // A session that stayed up was healthy, so the next attempt starts
         // fresh: a drop after hours of uptime reconnects at once instead of
         // inheriting an old backoff. A relay that accepts and instantly
@@ -101,7 +118,7 @@ pub async fn run(ctx: Arc<Ctx>, cfg: Config, identity: Arc<DaemonIdentity>) {
     }
 }
 
-async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIdentity>, data: &DataSockets, connected: &mut bool) -> Result<(), String> {
+async fn control_session(handler: &Handler, cfg: &Config, identity: &Arc<DaemonIdentity>, data: &DataSockets, connected: &mut bool) -> Result<(), String> {
     let target = url(cfg, &identity.server_id, None);
     let ws = connect(&target, CONNECT_TIMEOUT).await?;
     *connected = true;
@@ -140,7 +157,7 @@ async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIden
                     Some("sync") => {
                         let ids: Vec<String> = msg.get("connectionIds").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
                         for id in ids {
-                            ensure_data_socket(ctx, cfg, identity, data, id);
+                            ensure_data_socket(handler, cfg, identity, data, id);
                         }
                     }
                     Some("connected") => {
@@ -150,7 +167,7 @@ async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIden
                             if let Some(old) = data.lock().unwrap().remove(&id) {
                                 old.abort();
                             }
-                            ensure_data_socket(ctx, cfg, identity, data, id);
+                            ensure_data_socket(handler, cfg, identity, data, id);
                         }
                     }
                     Some("disconnected") => {
@@ -167,15 +184,15 @@ async fn control_session(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIden
     }
 }
 
-fn ensure_data_socket(ctx: &Arc<Ctx>, cfg: &Config, identity: &Arc<DaemonIdentity>, data: &DataSockets, connection_id: String) {
+fn ensure_data_socket(handler: &Handler, cfg: &Config, identity: &Arc<DaemonIdentity>, data: &DataSockets, connection_id: String) {
     let mut map = data.lock().unwrap();
     map.retain(|_, h| !h.is_finished());
     if map.contains_key(&connection_id) {
         return;
     }
-    let (ctx, cfg, identity, data2, id) = (ctx.clone(), cfg.clone(), identity.clone(), data.clone(), connection_id.clone());
+    let (handler, cfg, identity, data2, id) = (handler.clone(), cfg.clone(), identity.clone(), data.clone(), connection_id.clone());
     let handle = tokio::spawn(async move {
-        if let Err(e) = data_socket(ctx, &cfg, identity, &id).await {
+        if let Err(e) = data_socket(handler, &cfg, identity, &id).await {
             crate::warn!("relay data socket {id} ended: {e}");
         }
         data2.lock().unwrap().remove(&id);
@@ -202,7 +219,7 @@ fn ready_frame(binary_ciphertext: bool) -> Message {
     Message::Text(ready.to_string())
 }
 
-async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>, connection_id: &str) -> Result<(), String> {
+async fn data_socket(handler: Handler, cfg: &Config, identity: Arc<DaemonIdentity>, connection_id: &str) -> Result<(), String> {
     let target = url(cfg, &identity.server_id, Some(connection_id));
     let ws = connect(&target, HANDSHAKE_TIMEOUT).await?;
     let (mut sink, mut stream) = ws.split();
@@ -228,7 +245,7 @@ async fn data_socket(ctx: Arc<Ctx>, cfg: &Config, identity: Arc<DaemonIdentity>,
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Inbound>(64);
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Arc<str>>(256);
-    let session = tokio::spawn(session::run(ctx, in_rx, out_tx, true));
+    let session = tokio::spawn(handler(in_rx, out_tx, peer_key.clone()));
     let mut last_seen = Instant::now();
     let mut keepalive = tokio::time::interval(PING_INTERVAL);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

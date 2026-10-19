@@ -4,6 +4,7 @@ mod cleanup;
 mod config;
 mod daemon_config;
 mod e2ee;
+mod edge;
 mod egress;
 mod files;
 mod git_actions;
@@ -31,6 +32,7 @@ const HELP: &str = "paseo-lite — low-resource daemon for Claude Code and Codex
 USAGE:
     paseo-lite [--listen HOST:PORT] [--no-relay]   run the daemon
     paseo-lite pair                                print the pairing link + QR
+    paseo-lite edge help                           run agents on more machines (edge machines)
     paseo-lite help
 
 ENVIRONMENT (selection):
@@ -67,6 +69,11 @@ fn print_pairing(cfg: &Config, identity: &e2ee::DaemonIdentity) {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Before anything else: an edge machine has no app identity of its own.
+    if args.first().map(|a| a == "edge").unwrap_or(false) {
+        let cfg = Config::load(&[]);
+        std::process::exit(edge::cli(&cfg, &args[1..]));
+    }
     if args.iter().any(|a| a == "help" || a == "--help" || a == "-h") {
         print!("{HELP}");
         return;
@@ -116,6 +123,8 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     if cfg.relay_enabled {
         print_pairing(&cfg, &identity);
         tokio::spawn(relay::run(ctx.clone(), cfg.clone(), identity.clone()));
+        // Edge machines, on their own relay identity (idle until the first invite).
+        tokio::spawn(edge::hub::run(cfg.clone()));
     } else {
         crate::log!("relay disabled; connect directly over LAN/Tailscale/SSH tunnel");
     }
