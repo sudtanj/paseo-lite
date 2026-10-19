@@ -56,7 +56,19 @@ async fn ws_upgrade(State(state): State<AppState>, headers: HeaderMap, ws: WebSo
         return (StatusCode::FORBIDDEN, "Host not allowed").into_response();
     }
     let ctx = state.ctx.clone();
+    // The app (v0.9.1+) also offers its password as a `paseo.bearer.<password>`
+    // subprotocol and drops the socket (1006) unless the server selects it.
+    // Echo it back; the password itself is still checked on hello.
+    let ws = match bearer_protocol(&headers) {
+        Some(protocol) => ws.protocols([protocol]),
+        None => ws,
+    };
     ws.max_message_size(16 * 1024 * 1024).on_upgrade(move |socket| handle_socket(ctx, socket))
+}
+
+fn bearer_protocol(headers: &HeaderMap) -> Option<String> {
+    let offered = headers.get(header::SEC_WEBSOCKET_PROTOCOL)?.to_str().ok()?;
+    offered.split(',').map(str::trim).find(|p| p.starts_with("paseo.bearer.") && p.len() > "paseo.bearer.".len()).map(str::to_string)
 }
 
 async fn handle_socket(ctx: Arc<Ctx>, socket: WebSocket) {

@@ -223,6 +223,20 @@ async fn rejects_incompatible_protocol_and_bad_password() {
     assert_eq!(r["message"]["payload"]["status"], "server_info");
 }
 
+/// The app offers its password as a `paseo.bearer.<password>` subprotocol and
+/// fails the connection (1006) when the server does not select it.
+#[tokio::test]
+async fn selects_the_bearer_subprotocol_the_app_offers() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let d = start("bearer", Some("secret"));
+    let mut req = format!("ws://127.0.0.1:{}/ws", d.port).into_client_request().unwrap();
+    req.headers_mut().insert("Sec-WebSocket-Protocol", "paseo.bearer.secret".parse().unwrap());
+    let (mut ws, resp) = tokio_tungstenite::connect_async(req).await.expect("ws connect with subprotocol");
+    assert_eq!(resp.headers()["sec-websocket-protocol"], "paseo.bearer.secret");
+    let r = hello(&mut ws, Some("secret")).await;
+    assert_eq!(r["message"]["payload"]["status"], "server_info");
+}
+
 #[tokio::test]
 async fn unsupported_requests_get_an_rpc_error() {
     let d = start("rpcerr", None);
