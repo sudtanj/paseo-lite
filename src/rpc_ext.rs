@@ -361,7 +361,7 @@ impl Manager {
             "queuedTurns": self.cli_queue.len(),
             "claude": { "liveProcesses": self.claude.live_count(), "queued": self.claude.waiting_count(), "maxLive": self.claude.max_live(), "maxLiveMode": self.cfg.claude_max_live.label(), "keepWarm": self.cfg.claude_keep_warm },
             "codex": { "appServerRunning": self.codex.is_running(), "maxActive": self.slots("codex"), "maxActiveMode": self.cfg.codex_max_active.label(), "keepWarm": self.cfg.codex_keep_warm },
-            "capacity": self.capacity.as_ref().map(|c| c.status()),
+            "capacity": self.capacity.status(),
             "agents": { "total": self.agents.len(), "running": self.agents.values().filter(|a| a.status == "running").count() },
             "autoCompactPct": self.cfg.auto_compact_pct,
             "autoCompactTokens": self.cfg.auto_compact_tokens,

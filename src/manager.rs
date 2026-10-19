@@ -132,9 +132,9 @@ pub struct Manager {
     /// Turns (agentId, prompt) waiting for the CLI, across all projects and
     /// both providers, strictly first come first served.
     pub cli_queue: VecDeque<(String, String)>,
-    /// How many turns may run at once when a cap is `auto` (None when both
-    /// caps are fixed numbers).
-    pub capacity: Option<crate::capacity::Capacity>,
+    /// How many turns may run at once when a cap is `auto`, and the watch on
+    /// the container's limits that frees memory before it runs out.
+    pub capacity: crate::capacity::Capacity,
     claude_warm_at: Option<Instant>,
     codex_warm_at: Option<Instant>,
     pub bcast: broadcast::Sender<Arc<str>>,
@@ -212,7 +212,7 @@ impl Manager {
         let mut claude = ClaudePool::new(cfg.clone(), events_tx.clone());
         let codex = Codex::new(cfg.clone(), events_tx.clone());
         let auto = [cfg.claude_max_live, cfg.codex_max_active].contains(&crate::capacity::Mode::Auto);
-        let capacity = auto.then(|| crate::capacity::Capacity::new(cfg.agent_mb, cfg.auto_max_agents, cfg.auto_stable));
+        let capacity = crate::capacity::Capacity::new(auto, cfg.agent_mb, cfg.auto_max_agents, cfg.auto_stable);
         if let crate::capacity::Mode::Fixed(n) = cfg.claude_max_live {
             claude.set_max_live(n);
         }
@@ -315,7 +315,7 @@ impl Manager {
         let due = |t: Option<Instant>| t.map(|t| t.elapsed() >= WARM_RETRY).unwrap_or(true);
         match self.active_cli {
             Some("codex") => {
-                if self.cfg.codex_keep_warm && !self.codex.is_running() && due(self.codex_warm_at) && binary_available(&self.cfg.codex_bin) {
+                if self.cfg.codex_keep_warm && !self.strained() && !self.codex.is_running() && due(self.codex_warm_at) && binary_available(&self.cfg.codex_bin) {
                     self.codex_warm_at = Some(Instant::now());
                     let codex = self.codex.clone();
                     tokio::spawn(async move {
@@ -326,7 +326,7 @@ impl Manager {
                 }
             }
             Some("claude") => {
-                if self.cfg.claude_keep_warm && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
+                if self.cfg.claude_keep_warm && !self.strained() && self.claude.live_count() == 0 && !self.codex.is_running() && self.running.is_empty() && self.cli_queue.is_empty() && due(self.claude_warm_at) && binary_available(&self.cfg.claude_bin) {
                     // The process is tied to one session and cwd, so warm the Claude
                     // agent most likely to get the next prompt: the last one used.
                     let candidate = self
@@ -633,29 +633,40 @@ impl Manager {
     /// machine allows right now.
     pub fn slots(&self, cli: &str) -> usize {
         let mode = if cli == "codex" { self.cfg.codex_max_active } else { self.cfg.claude_max_live };
-        match (mode, &self.capacity) {
-            (crate::capacity::Mode::Fixed(n), _) => n,
-            (crate::capacity::Mode::Auto, Some(cap)) => cap.limit(),
-            (crate::capacity::Mode::Auto, None) => 1,
+        match mode {
+            crate::capacity::Mode::Fixed(n) => n,
+            crate::capacity::Mode::Auto => self.capacity.limit(),
         }
     }
 
     /// Auto capacity: read the machine, let the Claude pool keep as many
     /// processes as the new limit allows, and start queued turns when it
-    /// went up. Runs every tick.
+    /// went up. When the container is about to run out, release every idle
+    /// process so the daemon keeps the room it needs to stay in control.
+    /// Runs every tick.
     fn update_capacity(&mut self) {
         let queued = self.cli_queue.len() + self.claude.waiting_count();
         let running = self.running.len();
-        let Some(cap) = self.capacity.as_mut() else { return };
-        let grew = cap.update(running, queued);
+        let change = self.capacity.update(running, queued);
+        if change == crate::capacity::Change::Critical {
+            let freed = self.claude.release_idle();
+            if freed > 0 {
+                crate::warn!("capacity: released {freed} idle claude process(es) to free memory");
+            }
+        }
         let max = self.slots("claude");
         if max != self.claude.max_live() {
             let ready = self.claude.set_max_live(max);
             self.send_ready(ready);
         }
-        if grew {
+        if change == crate::capacity::Change::Grew {
             self.pump();
         }
+    }
+
+    /// Under pressure, optional work (warm-ups) waits.
+    fn strained(&self) -> bool {
+        self.capacity.strained()
     }
 
     /// Start Claude prompts the pool released from its waiting list.

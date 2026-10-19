@@ -141,7 +141,10 @@ pub fn deprioritize(cmd: &mut tokio::process::Command, cfg: &crate::config::Conf
     {
         let nice = cfg.agent_nice;
         let low_io = cfg.agent_low_io;
-        let oom = (cfg.agent_oom_score_adj > 0).then(|| cfg.agent_oom_score_adj.to_string().into_bytes());
+        // Relative to the daemon's own score: Docker's `--oom-score-adj` gives
+        // the whole container one value, and agents must still rank above
+        // the daemon so the kernel kills them first.
+        let oom = (cfg.agent_oom_score_adj > 0).then(|| agent_oom_score(own_oom_score(), cfg.agent_oom_score_adj).to_string().into_bytes());
         // SAFETY: the closure runs between fork and exec, so it only makes
         // async-signal-safe libc calls and never allocates (`oom` is built
         // beforehand). Failures are ignored: priority is best effort.
@@ -172,6 +175,32 @@ pub fn deprioritize(cmd: &mut tokio::process::Command, cfg: &crate::config::Conf
     }
     #[cfg(not(unix))]
     let _ = (cmd, cfg);
+}
+
+fn own_oom_score() -> i32 {
+    std::fs::read_to_string("/proc/self/oom_score_adj").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// An agent's `oom_score_adj`: `extra` above the daemon's, capped at 1000.
+/// At the cap the daemon is lowered where allowed (see `protect_daemon`).
+fn agent_oom_score(own: i32, extra: i32) -> i32 {
+    (own.max(0) + extra).min(1000)
+}
+
+/// Keep the daemon itself the last thing the OOM killer picks inside the
+/// container. Lowering the score needs CAP_SYS_RESOURCE, so this usually
+/// only works as root; otherwise agents still rank above it (or tie at 1000
+/// when the container already starts at 1000).
+pub fn protect_daemon() {
+    #[cfg(target_os = "linux")]
+    {
+        let own = own_oom_score();
+        if own > 0 && std::fs::write("/proc/self/oom_score_adj", "0").is_ok() {
+            crate::log!("daemon oom_score_adj lowered from {own} to 0");
+        } else if own >= 1000 {
+            crate::warn!("daemon oom_score_adj is {own}: agents can't rank above it, so the kernel may pick the daemon under memory pressure");
+        }
+    }
 }
 
 /// Locate an executable on PATH without spawning anything.
@@ -239,6 +268,15 @@ mod tests {
     fn missing_binary_is_unavailable() {
         assert!(!binary_available("definitely-not-a-real-binary-xyz"));
         assert!(binary_available("/bin/sh") || cfg!(windows));
+    }
+
+    #[test]
+    fn agents_rank_above_the_daemon_for_the_oom_killer() {
+        // Docker's --oom-score-adj 500 is inherited by the daemon.
+        assert_eq!(agent_oom_score(500, 500), 1000);
+        assert_eq!(agent_oom_score(0, 500), 500);
+        assert_eq!(agent_oom_score(900, 500), 1000);
+        assert_eq!(agent_oom_score(-200, 300), 300);
     }
 
     #[test]

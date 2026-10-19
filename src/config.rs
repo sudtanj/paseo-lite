@@ -51,7 +51,7 @@ pub struct Config {
     /// Niceness for `claude` / `codex` processes (and everything they run),
     /// so heavy agent work yields the CPU to the daemon. 0 = unchanged.
     pub agent_nice: i32,
-    /// `oom_score_adj` for agent processes: under memory pressure the kernel
+    /// Added to the daemon's `oom_score_adj` for agent processes: under memory pressure the kernel
     /// kills an agent before it touches the daemon. 0 = unchanged.
     pub agent_oom_score_adj: i32,
     /// Lowest best-effort I/O priority for agent processes.

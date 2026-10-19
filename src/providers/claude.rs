@@ -140,6 +140,15 @@ impl ClaudePool {
         }
     }
 
+    /// Stop every process that isn't running a turn. Returns how many.
+    pub fn release_idle(&mut self) -> usize {
+        let idle: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy).map(|(id, _)| id.clone()).collect();
+        for id in &idle {
+            self.stop(id);
+        }
+        idle.len()
+    }
+
     fn evict_one_idle(&mut self) -> bool {
         let victim = self.procs.iter().filter(|(_, p)| !p.busy).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
         match victim {

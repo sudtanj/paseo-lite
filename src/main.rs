@@ -95,6 +95,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     let pairing = cfg.relay_enabled.then(|| identity.pairing_url(&cfg.app_base_url, &cfg.relay_public_endpoint, cfg.relay_public_use_tls));
     let (bcast, _) = tokio::sync::broadcast::channel(2048);
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    providers::protect_daemon();
     let (manager, events_rx) = manager::Manager::new(cfg.clone(), identity.server_id.clone(), pairing, bcast.clone(), cmd_tx.clone());
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
     let manager_task = tokio::spawn(manager.run(cmd_rx, events_rx, stop_rx));
