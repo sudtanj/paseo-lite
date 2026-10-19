@@ -76,8 +76,10 @@ finishes or needs permission, a client that's looking at that agent gets nothing
 active client gets an in-app notice, and if nobody is active (phone locked, app closed) the phone
 gets a push notification via Expo.
 
-paseo-lite also serves a small built-in web UI at `http://<listen>/` (one HTML file, no build step).
-It covers the full supported flow: projects, agents, live timeline, approvals, modes, stop and archive.
+paseo-lite also serves a small built-in pairing page at `http://<listen>/` (one HTML file, no build step).
+It shows only a password form; after the daemon accepts the password over `/ws` it shows the relay
+pairing QR code and link, and locks again after two minutes or when the tab is hidden. It never lists
+projects or agents (use the Paseo app for that), and it stays disabled when `PASEO_PASSWORD` is unset.
 
 ## Build
 
@@ -153,7 +155,7 @@ src/providers/claude*.rs Claude Code pool + stream-json parser
 src/providers/codex*.rs  shared Codex app-server client + event mapping
 src/store.rs             agents.json + JSONL timelines
 src/usage.rs             token/cost ledger per provider and model, price list
-web/index.html           built-in web UI
+web/index.html           built-in pairing page (QR behind the password)
 ```
 
 ## Support the project

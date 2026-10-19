@@ -27,8 +27,17 @@ pub async fn serve(ctx: Arc<Ctx>, listen: String, hostnames: Vec<String>) -> std
     axum::serve(listener, app).tcp_nodelay(true).await
 }
 
+/// The pairing page. It holds no daemon data itself (that comes over `/ws`
+/// after the password), but keep it out of frames, caches and referrers.
 async fn index() -> Response {
-    ([(header::CACHE_CONTROL, "no-cache")], Html(INDEX_HTML)).into_response()
+    let headers = [
+        (header::CACHE_CONTROL, "no-store"),
+        (header::X_FRAME_OPTIONS, "DENY"),
+        (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'; base-uri 'none'; form-action 'none'; object-src 'none'"),
+        (header::REFERRER_POLICY, "no-referrer"),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ];
+    (headers, Html(INDEX_HTML)).into_response()
 }
 
 /// DNS-rebinding guard, same policy as the Node daemon: IP literals and

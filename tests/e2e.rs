@@ -187,7 +187,14 @@ fn serves_the_web_ui() {
     let mut body = String::new();
     s.read_to_string(&mut body).unwrap();
     assert!(body.starts_with("HTTP/1.1 200"), "{body}");
-    assert!(body.to_ascii_lowercase().contains("<html"));
+    let lower = body.to_ascii_lowercase();
+    assert!(lower.contains("<html"));
+    // Pairing page only: behind the password, never framed or cached, no agent/project RPCs.
+    assert!(lower.contains("x-frame-options: deny"), "{body}");
+    assert!(lower.contains("cache-control: no-store"), "{body}");
+    assert!(lower.contains("type=\"password\""));
+    assert!(lower.contains("daemon.get_pairing_offer.request"));
+    assert!(!lower.contains("fetch_agents_request"));
 }
 
 #[tokio::test]

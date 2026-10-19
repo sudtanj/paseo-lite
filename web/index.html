@@ -3,284 +3,150 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
 <title>Paseo Lite</title>
 <style>
-  :root { --bg:#0f1115; --panel:#171a21; --line:#262a33; --fg:#e6e8ec; --mute:#8b93a1; --acc:#6aa6ff; --ok:#3fb950; --bad:#f85149; --warn:#d29922; }
+  :root { --bg:#0f1115; --panel:#171a21; --line:#262a33; --fg:#e6e8ec; --mute:#8b93a1; --acc:#6aa6ff; --bad:#f85149; }
   * { box-sizing:border-box; }
-  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--fg); display:flex; height:100vh; }
-  aside { width:290px; border-right:1px solid var(--line); display:flex; flex-direction:column; background:var(--panel); }
-  main { flex:1; display:flex; flex-direction:column; min-width:0; }
-  header { padding:10px 14px; border-bottom:1px solid var(--line); display:flex; gap:8px; align-items:center; }
-  .grow { flex:1; } .mute { color:var(--mute); } .small { font-size:12px; }
-  button, select, input, textarea { font:inherit; color:var(--fg); background:#0c0e12; border:1px solid var(--line); border-radius:6px; padding:6px 9px; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,sans-serif; background:var(--bg); color:var(--fg); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:16px; }
+  .card { width:min(400px,100%); background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:22px; }
+  h1 { font-size:17px; margin:0 0 4px; }
+  .mute { color:var(--mute); } .small { font-size:12px; } .err { color:var(--bad); min-height:1.45em; margin:8px 0 0; }
+  button, input { font:inherit; color:var(--fg); background:#0c0e12; border:1px solid var(--line); border-radius:6px; padding:8px 10px; }
+  input { width:100%; }
   button { cursor:pointer; background:#1f2430; } button.primary { background:var(--acc); color:#0b1020; border-color:var(--acc); }
-  button.danger { color:var(--bad); }
-  #agents { overflow:auto; flex:1; }
-  .proj { padding:10px 14px 4px; color:var(--mute); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  .agent { padding:8px 14px; cursor:pointer; border-left:3px solid transparent; }
-  .agent:hover { background:#1c2029; } .agent.sel { background:#1f2533; border-left-color:var(--acc); }
-  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; background:var(--mute); }
-  .dot.running { background:var(--acc); } .dot.error { background:var(--bad); } .dot.attn { background:var(--warn); }
-  #timeline { flex:1; overflow:auto; padding:14px; display:flex; flex-direction:column; gap:10px; }
-  .msg { white-space:pre-wrap; word-wrap:break-word; max-width:900px; }
-  .user { align-self:flex-end; background:#1f2b45; padding:8px 11px; border-radius:10px; }
-  .reasoning { color:var(--mute); font-style:italic; border-left:2px solid var(--line); padding-left:9px; }
-  .tool { border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-family:ui-monospace,Menlo,monospace; font-size:12px; }
-  .tool summary { cursor:pointer; } .tool pre { margin:6px 0 0; white-space:pre-wrap; max-height:300px; overflow:auto; color:var(--mute); }
-  .st-failed { color:var(--bad); } .st-completed { color:var(--ok); } .st-running { color:var(--acc); }
-  .err { color:var(--bad); } .note { color:var(--mute); font-size:12px; }
-  .perm { border:1px solid var(--warn); border-radius:8px; padding:10px; margin:0 14px 10px; }
-  .perm pre { white-space:pre-wrap; max-height:200px; overflow:auto; font-size:12px; }
-  form#composer { display:flex; gap:8px; padding:10px 14px; border-top:1px solid var(--line); }
-  form#composer textarea { flex:1; resize:vertical; min-height:44px; max-height:40vh; }
-  dialog { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:10px; width:min(520px,92vw); }
-  dialog label { display:block; margin:10px 0 4px; color:var(--mute); font-size:12px; }
-  dialog input, dialog select, dialog textarea { width:100%; }
-  @media (max-width:720px) { aside { width:100%; display:none; } body.list aside { display:flex; } body.list main { display:none; } .back { display:inline-block !important; } }
-  .back { display:none; }
+  button:disabled { opacity:.6; cursor:default; }
+  .row { display:flex; gap:8px; margin-top:12px; } .row > * { flex:1; }
+  #qr { background:#fff; border-radius:8px; padding:6px; width:max-content; max-width:100%; margin:14px auto; }
+  #qr svg { display:block; max-width:100%; height:auto; }
+  [hidden] { display:none !important; }
 </style>
 </head>
-<body class="list">
-<aside>
-  <header><strong class="grow">Paseo Lite</strong><span id="conn" class="small mute">offline</span><button id="connBtn" title="Connect from the Paseo app or web via the relay">Connect</button><button id="newBtn" class="primary">New</button></header>
-  <div id="agents"></div>
-</aside>
-<main>
-  <header>
-    <button class="back" id="backBtn">‹</button>
-    <div class="grow"><div id="title">No agent selected</div><div id="meta" class="small mute"></div></div>
-    <select id="modeSel" hidden></select>
-    <button id="stopBtn" hidden>Stop</button>
-    <button id="archiveBtn" class="danger" hidden>Archive</button>
-  </header>
-  <div id="timeline"></div>
-  <div id="perms"></div>
-  <form id="composer"><textarea id="input" placeholder="Message the agent… (Ctrl+Enter to send)"></textarea><button class="primary">Send</button></form>
+<body>
+<!-- Nothing about the daemon is in this page: the pairing offer is fetched over
+     /ws only after the daemon accepts the password, and dropped on lock. -->
+<main class="card">
+  <h1>Paseo Lite</h1>
+
+  <section id="checking"><p class="mute">Connecting…</p></section>
+
+  <section id="unreachable" hidden>
+    <p class="err">Can't reach the daemon.</p>
+    <div class="row"><button id="retryBtn">Retry</button></div>
+  </section>
+
+  <section id="noPassword" hidden>
+    <p class="mute">This page is disabled because the daemon has no password. Set <code>PASEO_PASSWORD</code> and restart it, or run <code>paseo-lite pair</code> on the machine.</p>
+  </section>
+
+  <form id="login" hidden autocomplete="on">
+    <p class="mute small">Enter the daemon password to show the pairing QR code.</p>
+    <input id="pw" type="password" name="password" autocomplete="current-password" placeholder="Password" required autofocus>
+    <p id="loginErr" class="err" role="alert"></p>
+    <div class="row"><button id="unlockBtn" class="primary">Unlock</button></div>
+  </form>
+
+  <section id="pairing" hidden>
+    <p class="mute small">Scan with the Paseo app, or open the link on the device you want to pair. <b>Anyone with this link can control your agents</b> - keep it private.</p>
+    <div id="qr"></div>
+    <input id="url" readonly aria-label="Pairing link">
+    <p id="pairErr" class="err"></p>
+    <div class="row"><button id="copyBtn">Copy link</button><button id="openBtn">Open</button><button id="lockBtn" class="primary">Lock</button></div>
+    <p class="mute small">Locks automatically in <span id="left"></span>.</p>
+  </section>
 </main>
-<dialog id="connDlg">
-  <form method="dialog">
-    <strong>Connect via relay</strong>
-    <p class="small mute">Open the link on <b>app.paseo.sh</b> (or scan the QR with the Paseo app) to reach this daemon from anywhere. Traffic is end-to-end encrypted; the relay only sees ciphertext. <b>Anyone with this link can control your agents</b> - keep it private.</p>
-    <div id="connQr" style="background:#fff;border-radius:8px;padding:6px;width:max-content;max-width:100%;margin:8px auto"></div>
-    <label>Pairing link</label><input id="connUrl" readonly>
-    <p id="connErr" class="err"></p>
-    <div style="display:flex;gap:8px;justify-content:flex-end"><button type="button" id="connCopy">Copy link</button><button type="button" id="connOpen" class="primary">Open app.paseo.sh</button><button value="close">Close</button></div>
-  </form>
-</dialog>
-<dialog id="newDlg">
-  <form method="dialog" id="newForm">
-    <strong>New agent</strong>
-    <label>Provider</label><select id="nProvider"><option value="claude">Claude Code</option><option value="codex">Codex</option></select>
-    <label>Project directory</label><input id="nCwd" list="dirs" placeholder="~/projects/app" autocomplete="off"><datalist id="dirs"></datalist>
-    <label>Model (optional)</label><input id="nModel" placeholder="default">
-    <label>Mode</label><select id="nMode"></select>
-    <label>First prompt</label><textarea id="nPrompt" rows="4"></textarea>
-    <p id="nErr" class="err"></p>
-    <div style="display:flex;gap:8px;justify-content:flex-end"><button value="cancel" formnovalidate>Cancel</button><button id="nCreate" class="primary" value="ok">Create</button></div>
-  </form>
-</dialog>
 <script>
 const $ = (id) => document.getElementById(id);
-const MODES = {
-  claude: [["default","Always ask"],["acceptEdits","Accept edits"],["plan","Plan"],["bypassPermissions","Bypass"]],
-  codex: [["auto","Auto"],["read-only","Read only"],["full-access","Full access"]],
-};
-let ws, rid = 0, password = localStorage.getItem("paseoLitePassword") || null;
-const pending = new Map();
-const agents = new Map();
-let selected = null, rows = [];
-const clientId = localStorage.getItem("paseoLiteClient") || (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2));
-localStorage.setItem("paseoLiteClient", clientId);
+const AUTO_LOCK_SECS = 120;
+const VIEWS = ["checking", "unreachable", "noPassword", "login", "pairing"];
+let lockTimer = null;
 
-function send(message) { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "session", message })); }
-function rpc(message) {
-  const requestId = "r" + (++rid);
-  return new Promise((resolve) => { pending.set(requestId, resolve); send({ ...message, requestId }); setTimeout(() => pending.delete(requestId), 60000); });
+function show(view) { for (const v of VIEWS) $(v).hidden = v !== view; }
+
+// One short-lived socket per attempt: hello (with the password, if any), then
+// the pairing offer, then close. The password is never stored.
+function attempt(password) {
+  return new Promise((resolve) => {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    const ws = new WebSocket(`${proto}://${location.host}/ws`);
+    let done = false;
+    const finish = (result) => { if (done) return; done = true; clearTimeout(timer); try { ws.close(); } catch {} resolve(result); };
+    const timer = setTimeout(() => finish({ kind: "unreachable" }), 15000);
+    ws.onopen = () => {
+      const hello = { type: "hello", clientId: "web-pairing", clientType: "browser", protocolVersion: 1, capabilities: {} };
+      if (password) hello.auth = { kind: "password", password };
+      ws.send(JSON.stringify(hello));
+    };
+    ws.onerror = () => finish({ kind: "unreachable" });
+    ws.onclose = () => finish({ kind: "unreachable" });
+    ws.onmessage = (ev) => {
+      let msg; try { msg = JSON.parse(ev.data); } catch { return; }
+      if (msg.type === "hello.rejected") return finish({ kind: "rejected", reason: msg.reason });
+      if (msg.type !== "session") return;
+      const m = msg.message || {}, p = m.payload || {};
+      if (m.type === "status" && p.status === "server_info") {
+        // No password sent and still accepted: the daemon has none, keep the page closed.
+        if (!password) return finish({ kind: "noPassword" });
+        ws.send(JSON.stringify({ type: "session", message: { type: "daemon.get_pairing_offer.request", requestId: "pair" } }));
+      } else if (m.type === "daemon.get_pairing_offer.response") {
+        finish({ kind: "offer", offer: p });
+      }
+    };
+  });
 }
 
-function connect() {
-  const proto = location.protocol === "https:" ? "wss" : "ws";
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
-  ws.onopen = () => {
-    const hello = { type: "hello", clientId, clientType: "browser", protocolVersion: 1, capabilities: {} };
-    if (password) hello.auth = { kind: "password", password };
-    ws.send(JSON.stringify(hello));
-  };
-  ws.onclose = () => { $("conn").textContent = "offline"; setTimeout(connect, 2000); };
-  ws.onmessage = (ev) => {
-    const msg = JSON.parse(ev.data);
-    if (msg.type === "hello.rejected") {
-      password = prompt(msg.reason === "incorrect_password" ? "Wrong password, try again" : "Daemon password");
-      if (password) localStorage.setItem("paseoLitePassword", password);
-      return;
-    }
-    if (msg.type !== "session") return;
-    handle(msg.message);
-  };
-  setInterval(() => ws.readyState === 1 && ws.send('{"type":"ping"}'), 10000);
+async function probe() {
+  show("checking");
+  $("unreachable").querySelector(".err").textContent = "Can't reach the daemon.";
+  const r = await attempt(null);
+  if (r.kind === "noPassword") return show("noPassword");
+  if (r.kind === "rejected" && r.reason === "password_required") { show("login"); $("pw").focus(); return; }
+  if (r.kind === "rejected") { show("unreachable"); $("unreachable").querySelector(".err").textContent = "This page is out of date with the daemon (" + r.reason + ")."; return; }
+  show("unreachable");
 }
 
-function handle(m) {
-  const p = m.payload || {};
-  if (p.requestId && pending.has(p.requestId)) { pending.get(p.requestId)(m); pending.delete(p.requestId); }
-  switch (m.type) {
-    case "status":
-      if (p.status === "server_info") { $("conn").textContent = p.hostname || "online"; loadAgents(); }
-      break;
-    case "agent_update":
-      if (p.kind === "upsert") agents.set(p.agent.id, p.agent); else agents.delete(p.agentId);
-      renderList(); if (selected && (p.agentId === selected || p.agent?.id === selected)) { renderHeader(); renderPerms(); }
-      break;
-    case "agent_stream":
-      if (p.agentId === selected && p.event.type === "timeline") { mergeRow(p.event.item); renderTimeline(); }
-      break;
-    case "agent_permission_request": case "agent_permission_resolved":
-      if (p.agentId === selected) renderPerms();
-      break;
-  }
-}
-
-async function loadAgents() {
-  const r = await rpc({ type: "fetch_agents_request" });
-  agents.clear();
-  for (const e of r.payload.entries) agents.set(e.agent.id, e.agent);
-  renderList();
-  if (selected) select(selected);
-}
-
-function renderList() {
-  const groups = {};
-  for (const a of agents.values()) if (!a.archivedAt) (groups[a.cwd] ||= []).push(a);
-  const box = $("agents"); box.innerHTML = "";
-  for (const cwd of Object.keys(groups).sort()) {
-    const h = document.createElement("div"); h.className = "proj"; h.textContent = cwd.split("/").pop() || cwd; h.title = cwd; box.appendChild(h);
-    for (const a of groups[cwd].sort((x, y) => y.updatedAt.localeCompare(x.updatedAt))) {
-      const d = document.createElement("div"); d.className = "agent" + (a.id === selected ? " sel" : "");
-      const dot = a.pendingPermissions.length || a.attentionReason === "permission" ? "attn" : a.status;
-      d.innerHTML = `<span class="dot ${dot}"></span>`;
-      d.append(a.title || "Untitled");
-      const sub = document.createElement("div"); sub.className = "small mute"; sub.textContent = `${a.provider} · ${a.status}`; d.appendChild(sub);
-      d.onclick = () => select(a.id);
-      box.appendChild(d);
-    }
-  }
-}
-
-async function select(id) {
-  selected = id; document.body.classList.remove("list");
-  renderList(); renderHeader(); rows = []; renderTimeline();
-  const r = await rpc({ type: "fetch_agent_timeline_request", agentId: id, direction: "tail", limit: 300 });
-  if (selected !== id) return;
-  rows = r.payload.entries.map((e) => structuredClone(e.item));
-  renderTimeline(); renderPerms();
-  if (agents.get(id)?.attentionReason) send({ type: "clear_agent_attention", agentId: id });
-}
-
-function mergeRow(item) {
-  const last = rows[rows.length - 1];
-  if ((item.type === "assistant_message" || item.type === "reasoning") && last && last.type === item.type) { last.text += item.text; return; }
-  if (item.type === "tool_call") { const i = rows.findIndex((r) => r.type === "tool_call" && r.callId === item.callId); if (i >= 0) { rows[i] = item; return; } }
-  rows.push(structuredClone(item));
-}
-
-function renderHeader() {
-  const a = agents.get(selected);
-  $("title").textContent = a ? (a.title || "Untitled") : "No agent selected";
-  $("meta").textContent = a ? `${a.provider}${a.model ? " · " + a.model : ""} · ${a.cwd} · ${a.status}` : "";
-  for (const id of ["modeSel", "stopBtn", "archiveBtn"]) $(id).hidden = !a;
-  if (!a) return;
-  $("stopBtn").disabled = a.status !== "running";
-  const sel = $("modeSel"); sel.innerHTML = "";
-  for (const [v, l] of MODES[a.provider] || []) sel.add(new Option(l, v, false, v === a.currentModeId));
-}
-
-function toolText(item) {
-  const d = item.detail || {};
-  const head = d.command || d.filePath || d.query || d.url || d.label || d.description || "";
-  const body = d.output || d.content || d.unifiedDiff || d.newString || d.result || d.text || d.log || (d.type === "unknown" ? JSON.stringify(d.input, null, 1) : "");
-  return [head, body];
-}
-
-function renderTimeline() {
-  const box = $("timeline"); const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
-  box.innerHTML = "";
-  for (const it of rows) {
-    let el = document.createElement("div");
-    if (it.type === "user_message") { el.className = "msg user"; el.textContent = it.text; }
-    else if (it.type === "assistant_message") { el.className = "msg"; el.textContent = it.text; }
-    else if (it.type === "reasoning") { el.className = "msg reasoning"; el.textContent = it.text; }
-    else if (it.type === "tool_call") {
-      el = document.createElement("details"); el.className = "tool";
-      const [head, body] = toolText(it);
-      const s = document.createElement("summary"); s.innerHTML = `<span class="st-${it.status}">●</span> `; s.append(`${it.name} ${head}`.slice(0, 200)); el.appendChild(s);
-      if (body || it.error) { const pre = document.createElement("pre"); pre.textContent = body || String(it.error); el.appendChild(pre); }
-    }
-    else if (it.type === "todo") { el.className = "msg note"; el.textContent = it.items.map((t) => (t.completed ? "☑ " : "☐ ") + t.text).join("\n"); }
-    else if (it.type === "error") { el.className = "msg err"; el.textContent = it.message; }
-    else if (it.type === "notification") { el.className = "note"; el.textContent = it.message; }
-    else continue;
-    box.appendChild(el);
-  }
-  if (stick) box.scrollTop = box.scrollHeight;
-}
-
-function renderPerms() {
-  const box = $("perms"); box.innerHTML = "";
-  const a = agents.get(selected); if (!a) return;
-  for (const req of a.pendingPermissions) {
-    const d = document.createElement("div"); d.className = "perm";
-    const t = document.createElement("strong"); t.textContent = `${req.title || req.name} needs approval`; d.appendChild(t);
-    const pre = document.createElement("pre"); const [head, body] = toolText(req); pre.textContent = [head, body || JSON.stringify(req.input, null, 1)].filter(Boolean).join("\n"); d.appendChild(pre);
-    const answer = (behavior) => send({ type: "agent_permission_response", agentId: a.id, requestId: req.id, response: behavior === "allow" ? { behavior } : { behavior, message: "Denied by user" } });
-    const ok = document.createElement("button"); ok.className = "primary"; ok.textContent = "Allow"; ok.onclick = () => answer("allow");
-    const no = document.createElement("button"); no.className = "danger"; no.textContent = "Deny"; no.style.marginLeft = "8px"; no.onclick = () => answer("deny");
-    d.append(ok, no); box.appendChild(d);
-  }
-}
-
-$("composer").onsubmit = async (e) => {
-  e.preventDefault(); const text = $("input").value.trim(); if (!text || !selected) return;
-  $("input").value = "";
-  const r = await rpc({ type: "send_agent_message_request", agentId: selected, text, messageId: crypto.randomUUID ? crypto.randomUUID() : undefined });
-  if (!r.payload.accepted) alert(r.payload.error);
-};
-$("input").onkeydown = (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) $("composer").requestSubmit(); };
-$("stopBtn").onclick = () => rpc({ type: "cancel_agent_request", agentId: selected });
-$("archiveBtn").onclick = async () => { if (!confirm("Archive this agent? Its process is released.")) return; await rpc({ type: "archive_agent_request", agentId: selected }); selected = null; document.body.classList.add("list"); renderHeader(); rows = []; renderTimeline(); renderList(); };
-$("modeSel").onchange = (e) => rpc({ type: "set_agent_mode_request", agentId: selected, modeId: e.target.value });
-$("backBtn").onclick = () => document.body.classList.add("list");
-
-function fillModes() { const sel = $("nMode"); sel.innerHTML = ""; for (const [v, l] of MODES[$("nProvider").value]) sel.add(new Option(l, v)); }
-$("nProvider").onchange = fillModes;
-$("newBtn").onclick = () => { fillModes(); $("nErr").textContent = ""; $("nCwd").value = localStorage.getItem("paseoLiteLastCwd") || ""; $("newDlg").showModal(); };
-let sugTimer;
-$("nCwd").oninput = () => { clearTimeout(sugTimer); sugTimer = setTimeout(async () => {
-  const r = await rpc({ type: "directory_suggestions_request", query: $("nCwd").value, limit: 30 });
-  const dl = $("dirs"); dl.innerHTML = ""; for (const d of r.payload.directories) dl.appendChild(new Option(d));
-}, 200); };
-$("nCreate").onclick = async (e) => {
+$("login").onsubmit = async (e) => {
   e.preventDefault();
-  const config = { provider: $("nProvider").value, cwd: $("nCwd").value.trim(), modeId: $("nMode").value };
-  if ($("nModel").value.trim()) config.model = $("nModel").value.trim();
-  const prompt = $("nPrompt").value.trim();
-  const r = await rpc({ type: "create_agent_request", config, labels: {}, ...(prompt ? { initialPrompt: prompt } : {}) });
-  if (r.payload.status !== "agent_created") { $("nErr").textContent = r.payload.error; return; }
-  localStorage.setItem("paseoLiteLastCwd", config.cwd);
-  $("nPrompt").value = ""; $("newDlg").close();
-  agents.set(r.payload.agent.id, r.payload.agent); select(r.payload.agent.id);
+  const password = $("pw").value;
+  if (!password) return;
+  $("unlockBtn").disabled = true; $("loginErr").textContent = "";
+  const r = await attempt(password);
+  $("unlockBtn").disabled = false;
+  if (r.kind === "offer") { $("pw").value = ""; return showOffer(r.offer); }
+  $("pw").value = ""; $("pw").focus();
+  $("loginErr").textContent = r.kind === "rejected" && r.reason === "incorrect_password" ? "Wrong password." : "Can't reach the daemon, try again.";
 };
-$("connBtn").onclick = async () => {
-  $("connErr").textContent = ""; $("connUrl").value = ""; $("connQr").innerHTML = "";
-  $("connDlg").showModal();
-  const r = await rpc({ type: "daemon.get_pairing_offer.request" });
-  const p = r.payload;
-  if (!p.relayEnabled) { $("connErr").textContent = "Relay is disabled on this daemon (PASEO_RELAY_ENABLED=false)."; return; }
-  $("connUrl").value = p.url;
-  if (p.qr) $("connQr").innerHTML = p.qr.replace(/<\?xml[^>]*\?>/, "").replace(/<!DOCTYPE[^>]*>/, "");
-};
-$("connCopy").onclick = async () => { $("connUrl").select(); try { await navigator.clipboard.writeText($("connUrl").value); } catch { document.execCommand("copy"); } };
-$("connOpen").onclick = () => { if ($("connUrl").value) window.open($("connUrl").value, "_blank", "noopener"); };
-connect();
+
+function showOffer(p) {
+  $("qr").innerHTML = ""; $("url").value = ""; $("pairErr").textContent = "";
+  if (!p.relayEnabled) $("pairErr").textContent = "Relay is disabled on this daemon (PASEO_RELAY_ENABLED=false).";
+  else {
+    $("url").value = p.url;
+    if (p.qr) $("qr").innerHTML = p.qr.replace(/<\?xml[^>]*\?>/, "").replace(/<!DOCTYPE[^>]*>/, "");
+  }
+  $("qr").hidden = !p.qr; $("url").hidden = !p.url; $("copyBtn").disabled = $("openBtn").disabled = !p.url;
+  show("pairing");
+  let left = AUTO_LOCK_SECS;
+  const tick = () => { $("left").textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, "0")}`; if (left-- <= 0) lock(); };
+  clearInterval(lockTimer); tick(); lockTimer = setInterval(tick, 1000);
+}
+
+function lock() {
+  clearInterval(lockTimer); lockTimer = null;
+  $("qr").innerHTML = ""; $("url").value = "";
+  show("login"); $("loginErr").textContent = ""; $("pw").focus();
+}
+
+// The previous web UI remembered the password here; forget it.
+localStorage.removeItem("paseoLitePassword");
+$("lockBtn").onclick = lock;
+// Hidden tab (switched away, phone locked): drop the QR.
+document.addEventListener("visibilitychange", () => { if (document.hidden && lockTimer) lock(); });
+$("retryBtn").onclick = probe;
+$("copyBtn").onclick = async () => { try { await navigator.clipboard.writeText($("url").value); } catch { $("url").select(); document.execCommand("copy"); } };
+$("openBtn").onclick = () => { if ($("url").value) window.open($("url").value, "_blank", "noopener,noreferrer"); };
+probe();
 </script>
 </body>
 </html>
