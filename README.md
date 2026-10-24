@@ -61,6 +61,22 @@ job summary shows the JavaScript size a browser downloads. WebAssembly would not
 Web, its cost is the JS UI and the DOM, which WebAssembly cannot reach without a full rewrite plus JS
 glue, and the only compute-heavy part (the NaCl box encryption) is already small.
 
+**Privacy of the pairing link.** The link holds the server id and the daemon's public key, and over
+the relay it is all a client needs, so treat it like a password. On this site it stays in your browser:
+
+- Paste it into the app's pair dialog rather than opening it: an opened link stays in the address bar
+  and browser history (and in history sync). A `#fragment` is never sent to GitHub either way.
+- The app parses it locally and saves the host in this browser's local storage. The web build has no
+  analytics, error reporting or push registration.
+- The page carries a Content Security Policy: it can only connect to `wss://relay.paseo.sh`, a daemon
+  on `localhost`, and what you add in the `PAGES_EXTRA_CONNECT_SRC` repository variable (a self-hosted
+  relay or an HTTPS daemon, e.g. `wss://relay.example.com wss://paseo.example.com`). No third-party
+  scripts, and no referrer is sent. The relay only sees the server id and encrypted traffic.
+- Local storage is shared by every page on the same origin. All `<user>.github.io/*` project sites
+  share one, so a script on another of your Pages sites could read it. For full isolation, serve this
+  site from its own origin: a custom (sub)domain in Settings > Pages, or a separate GitHub
+  organization's `<org>.github.io`.
+
 ## Protocol compatibility
 
 paseo-lite speaks Paseo's core WebSocket protocol subset with the upstream message names and shapes:

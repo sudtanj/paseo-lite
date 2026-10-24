@@ -119,6 +119,7 @@ jobs:
         working-directory: upstream/packages/app/dist
         env:
           BASE: ${{ steps.pages.outputs.base_path }}
+          EXTRA_CONNECT_SRC: ${{ vars.PAGES_EXTRA_CONNECT_SRC }}
         run: |
           # Source maps are only for debugging; they would double the download size.
           find . -name '*.map' -delete
@@ -129,6 +130,23 @@ jobs:
             sed -i -E -e 's#(href|src)="/([^/"])#\1="'"$BASE"'/\2#g' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' index.html
             sed -i -E -e 's#"(id|start_url|scope|src)": "/#"\1": "'"$BASE"'/#' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' manifest.json
           fi
+          # Keep what you paste (pairing links) and what the app stores in this browser: a
+          # Content Security Policy lets the page talk only to the Paseo relay, a daemon on this
+          # machine, and the sources in the PAGES_EXTRA_CONNECT_SRC repository variable (e.g. a
+          # self-hosted relay or an HTTPS daemon: "wss://relay.example.com wss://paseo.example.com").
+          # No third-party scripts, no other hosts for fetch/WebSocket/beacons, no referrer.
+          # 'wasm-unsafe-eval' only lets bundled WebAssembly compile; it opens no network path.
+          case "$EXTRA_CONNECT_SRC" in *[!A-Za-z0-9:/.*\ \[\]-]*)
+            echo "::error::PAGES_EXTRA_CONNECT_SRC may only hold space-separated sources like wss://host:port"; exit 1;; esac
+          csp="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'"
+          csp="$csp; connect-src 'self' data: blob: wss://relay.paseo.sh ws://localhost:* ws://127.0.0.1:* ${EXTRA_CONNECT_SRC}"
+          csp="$csp; img-src 'self' data: blob: https://avatars.githubusercontent.com; font-src 'self' data:"
+          csp="$csp; media-src 'self' data: blob:; frame-src 'self' blob: data:; worker-src 'self' blob:"
+          csp="$csp; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+          csp=$(printf '%s' "$csp" | tr -s ' ')
+          grep -q '^    <meta charset="utf-8" />$' index.html || { echo "::error::index.html head changed upstream"; exit 1; }
+          sed -i "s|^    <meta charset=\"utf-8\" />\$|&\n    <meta http-equiv=\"Content-Security-Policy\" content=\"${csp}\" />\n    <meta name=\"referrer\" content=\"no-referrer\" />|" index.html
+          echo "[*] CSP: $csp"
           # Pages has no SPA rewrites: unknown paths (deep links, reloads) get the app too.
           cp index.html 404.html
           touch .nojekyll
@@ -159,12 +177,13 @@ jobs:
             code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
             [ "$code" = 200 ] || { echo "::error::$path answered $code"; exit 1; }
           done
-          timeout 120 google-chrome --headless=new --no-sandbox --disable-gpu --enable-logging=stderr --v=0 \
+          timeout 120 google-chrome --headless=new --no-sandbox --disable-gpu --enable-logging=stderr --v=1 \
             --virtual-time-budget=20000 --dump-dom "http://127.0.0.1:8080$BASE/" > dom.html 2> chrome.log || true
           if grep -q '<div id="root"></div>' dom.html || ! grep -q '<div id="root">' dom.html; then
             echo "::error::the app did not render"; grep -i 'uncaught\|error' chrome.log | head -20; exit 1
           fi
-          grep -i 'uncaught' chrome.log | head -10 | sed 's/^/::warning::/' || true
+          grep -q 'http-equiv="Content-Security-Policy"' "$dist/index.html" || { echo "::error::the CSP meta tag is missing"; exit 1; }
+          grep -iE 'uncaught|refused to|content security policy' chrome.log | head -20 | sed 's/^/::warning::/' || true
           echo "[*] the app rendered ($(wc -c < dom.html) bytes of DOM)"
 
       - uses: actions/upload-pages-artifact@v3
