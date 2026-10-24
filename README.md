@@ -39,6 +39,26 @@ The relay code is a byte-compatible port of `@getpaseo/relay`:
 The default relay is `relay.paseo.sh:443`. You can point it at a self-hosted
 [paseo-relay](https://github.com/getpaseo/paseo-relay) with `PASEO_RELAY_ENDPOINT`.
 
+### Web app on GitHub Pages
+
+`.github/workflows/pages.yml` builds the official Paseo web app (upstream `packages/app`, pinned to a
+release, `v0.12.0` by default) and publishes it at `https://sudtanj.github.io/paseo-lite/`, so you don't
+depend on app.paseo.sh and the app version stays one that works with paseo-lite. Run it from the
+Actions tab, optionally with another upstream tag. To make the pairing QR/link open this copy:
+
+```sh
+PASEO_APP_BASE_URL=https://sudtanj.github.io/paseo-lite paseo-lite
+```
+
+The page is HTTPS, so it reaches the daemon through the relay (end-to-end encrypted, as with
+app.paseo.sh). Browsers block plain `ws://` from an HTTPS page, so a direct connection only works to
+`localhost` or to a daemon behind HTTPS whose name is in `PASEO_HOSTNAMES`.
+
+The build is upstream's own `expo export` with source maps removed; the job summary shows the
+JavaScript size a browser downloads. WebAssembly would not make it lighter: the app is React Native
+Web, its cost is the JS UI and the DOM, which WebAssembly cannot reach without a full rewrite plus JS
+glue, and the only compute-heavy part (the NaCl box encryption) is already small.
+
 ## Protocol compatibility
 
 paseo-lite speaks Paseo's core WebSocket protocol subset with the upstream message names and shapes:

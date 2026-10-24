@@ -1,0 +1,132 @@
+name: pages
+
+# Builds the upstream Paseo web app (getpaseo/paseo, packages/app) at a pinned release and
+# publishes it on GitHub Pages, so a browser can pair with paseo-lite through the relay
+# without depending on app.paseo.sh. Point the daemon's pairing link at it with
+# PASEO_APP_BASE_URL=https://<user>.github.io/<repo> (or your custom domain).
+#
+# One-time setup: Settings > Pages > Build and deployment > Source: GitHub Actions.
+#
+# Only official actions, no Jekyll, no extra build tools: upstream's own `expo export` does
+# the build, then a few shell/node lines adapt the output to the Pages subpath.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "getpaseo/paseo tag or commit to build"
+        required: true
+        default: "v0.12.0"
+  push:
+    branches: [main]
+    paths: [.github/workflows/pages.yml]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'v0.12.0' }}
+  # Skip the large binaries other upstream workspaces download on install; the web export
+  # needs none of them.
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  PUPPETEER_SKIP_DOWNLOAD: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - id: pages
+        uses: actions/configure-pages@v5
+
+      - uses: actions/checkout@v4
+        with:
+          repository: getpaseo/paseo
+          ref: ${{ env.UPSTREAM_REF }}
+          path: upstream
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+
+      - name: Install
+        working-directory: upstream
+        run: node scripts/npm-retry.mjs ci --no-audit --no-fund
+
+      # A project site lives under /<repo>/, but the app assumes the domain root. Expo's
+      # baseUrl prefixes routes and bundles; the same value is inlined for the one place
+      # that navigates with a hard-coded root path (the notification-click fallback).
+      - name: Serve from the Pages base path
+        working-directory: upstream/packages/app
+        env:
+          BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          echo "[*] base path: '${BASE:-/}'"
+          [ -n "$BASE" ] || exit 0
+          grep -q 'typedRoutes: true,' app.config.js \
+            || { echo "::error::app.config.js changed upstream; update the baseUrl patch"; exit 1; }
+          sed -i 's|typedRoutes: true,|typedRoutes: true,\n      ...(process.env.EXPO_PUBLIC_PAGES_BASE_PATH ? { baseUrl: process.env.EXPO_PUBLIC_PAGES_BASE_PATH } : {}),|' app.config.js
+          f=src/utils/os-notifications.ts
+          if grep -q 'location.assign(route);' "$f"; then
+            sed -i -e 's|location.assign(route);|location.assign((process.env.EXPO_PUBLIC_PAGES_BASE_PATH \|\| "") + route);|' \
+                   -e 's|location.href = route;|location.href = (process.env.EXPO_PUBLIC_PAGES_BASE_PATH \|\| "") + route;|' "$f"
+          else
+            echo "::warning::notification fallback not patched ($f changed upstream); clicking a notification may open the wrong path"
+          fi
+
+      - name: Build
+        working-directory: upstream
+        env:
+          EXPO_PUBLIC_PAGES_BASE_PATH: ${{ steps.pages.outputs.base_path }}
+          NODE_OPTIONS: --max-old-space-size=6144
+        run: npm run build:web --workspace=@getpaseo/app
+
+      - name: Adapt the output for Pages
+        working-directory: upstream/packages/app/dist
+        env:
+          BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          # Source maps are only for debugging; they would double the download size.
+          find . -name '*.map' -delete
+          if [ -n "$BASE" ]; then
+            # Root-absolute links in the hand-written HTML shell (manifest, icons), and the
+            # PWA manifest's scope and icons. The second expression undoes a double prefix on
+            # paths Expo already wrote under the base path.
+            sed -i -E -e 's#(href|src)="/([^/"])#\1="'"$BASE"'/\2#g' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' index.html
+            sed -i -E -e 's#"(id|start_url|scope|src)": "/#"\1": "'"$BASE"'/#' -e 's#"'"$BASE$BASE"'/#"'"$BASE"'/#g' manifest.json
+          fi
+          # Pages has no SPA rewrites: unknown paths (deep links, reloads) get the app too.
+          cp index.html 404.html
+          touch .nojekyll
+          {
+            echo "### Paseo web app ${UPSTREAM_REF}"
+            echo
+            echo "| | size |"
+            echo "|---|---|"
+            echo "| site | $(du -sh . | cut -f1) |"
+            echo "| JavaScript | $(find . -name '*.js' -print0 | du -ch --files0-from=- | tail -1 | cut -f1) |"
+            echo "| JavaScript, gzipped (what a browser downloads) | $(find . -name '*.js' -exec cat {} + | gzip -9 | wc -c | numfmt --to=iec) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: upstream/packages/app/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
