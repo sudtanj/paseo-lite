@@ -54,8 +54,10 @@ The page is HTTPS, so it reaches the daemon through the relay (end-to-end encryp
 app.paseo.sh). Browsers block plain `ws://` from an HTTPS page, so a direct connection only works to
 `localhost` or to a daemon behind HTTPS whose name is in `PASEO_HOSTNAMES`.
 
-The build is upstream's own `expo export` with source maps removed; the job summary shows the
-JavaScript size a browser downloads. WebAssembly would not make it lighter: the app is React Native
+The build is upstream's own `expo export` with source maps removed. For weak devices, the Mermaid
+diagram runtime (~3.6 MB, inlined in the main bundle upstream) is shipped as its own file and loaded
+only when a message shows a diagram, and a headless Chrome check makes sure the app still starts. The
+job summary shows the JavaScript size a browser downloads. WebAssembly would not make it lighter: the app is React Native
 Web, its cost is the JS UI and the DOM, which WebAssembly cannot reach without a full rewrite plus JS
 glue, and the only compute-heavy part (the NaCl box encryption) is already small.
 

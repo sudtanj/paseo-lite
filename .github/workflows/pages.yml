@@ -83,6 +83,31 @@ jobs:
             echo "::warning::notification fallback not patched ($f changed upstream); clicking a notification may open the wrong path"
           fi
 
+      # Lighter startup for weak devices: the Mermaid diagram runtime (~3.6 MB) is inlined in
+      # the main bundle as a string, so every visitor downloads and parses it. Ship it as a
+      # static file instead; the sandboxed iframe loads it only when a diagram is shown, and
+      # it talks to the app through postMessage either way.
+      - name: Load the Mermaid runtime on demand
+        working-directory: upstream/packages/app
+        run: |
+          d=src/components/markdown/fence/mermaid
+          f=$d/iframe-runtime.web.tsx
+          if grep -q '^import { mermaidRuntimeHtml } from "./runtime/html.gen";$' "$f" \
+             && grep -q 'srcDoc={mermaidRuntimeHtml}' "$f" \
+             && [ "$(grep -rl 'html.gen' src --include=*.web.tsx --include=*.web.ts --include=*.tsx --include=*.ts | grep -v '\.native\.\|\.test\.' | wc -l)" = 1 ]; then
+            node -e '
+              const fs = require("fs");
+              const m = fs.readFileSync(process.argv[1], "utf8").match(/export const mermaidRuntimeHtml = (".*");/s);
+              if (!m) { console.error("::error::html.gen.ts format changed upstream"); process.exit(1); }
+              fs.writeFileSync(process.argv[2], JSON.parse(m[1]));
+            ' "$d/runtime/html.gen.ts" public/mermaid-runtime.html
+            sed -i -e '/^import { mermaidRuntimeHtml } from ".\/runtime\/html.gen";$/d' \
+                   -e 's|srcDoc={mermaidRuntimeHtml}|src={(process.env.EXPO_PUBLIC_PAGES_BASE_PATH \|\| "") + "/mermaid-runtime.html"}|' "$f"
+            echo "[*] Mermaid runtime: $(wc -c < public/mermaid-runtime.html) bytes moved out of the main bundle"
+          else
+            echo "::warning::Mermaid runtime left inline ($f changed upstream)"
+          fi
+
       - name: Build
         working-directory: upstream
         env:
@@ -116,6 +141,31 @@ jobs:
             echo "| JavaScript | $(find . -name '*.js' -print0 | du -ch --files0-from=- | tail -1 | cut -f1) |"
             echo "| JavaScript, gzipped (what a browser downloads) | $(find . -name '*.js' -exec cat {} + | gzip -9 | wc -c | numfmt --to=iec) |"
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The patches above only change paths and loading, but a mistake would show up as a blank
+      # page, not a build error. Serve the output under the same base path and check that the
+      # app renders in the runner's preinstalled Chrome.
+      - name: Smoke test (the app starts)
+        env:
+          BASE: ${{ steps.pages.outputs.base_path }}
+        run: |
+          dist="$PWD/upstream/packages/app/dist"
+          root="$RUNNER_TEMP/site"; mkdir -p "$root"
+          if [ -n "$BASE" ]; then mkdir -p "$root$(dirname "$BASE")"; ln -s "$dist" "$root$BASE"; else root="$dist"; fi
+          python3 -m http.server 8080 --bind 127.0.0.1 --directory "$root" >/dev/null 2>&1 &
+          sleep 1
+          paths="$BASE/"; [ -f "$dist/mermaid-runtime.html" ] && paths="$paths $BASE/mermaid-runtime.html"
+          for path in $paths; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8080$path")
+            [ "$code" = 200 ] || { echo "::error::$path answered $code"; exit 1; }
+          done
+          timeout 120 google-chrome --headless=new --no-sandbox --disable-gpu --enable-logging=stderr --v=0 \
+            --virtual-time-budget=20000 --dump-dom "http://127.0.0.1:8080$BASE/" > dom.html 2> chrome.log || true
+          if grep -q '<div id="root"></div>' dom.html || ! grep -q '<div id="root">' dom.html; then
+            echo "::error::the app did not render"; grep -i 'uncaught\|error' chrome.log | head -20; exit 1
+          fi
+          grep -i 'uncaught' chrome.log | head -10 | sed 's/^/::warning::/' || true
+          echo "[*] the app rendered ($(wc -c < dom.html) bytes of DOM)"
 
       - uses: actions/upload-pages-artifact@v3
         with:
