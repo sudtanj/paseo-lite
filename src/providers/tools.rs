@@ -46,6 +46,24 @@ pub fn claude_detail(name: &str, input: &Value, output: Option<&str>) -> Value {
     }
 }
 
+/// One line of a sub-agent's activity log: `[Tool] what it touched`.
+pub fn claude_action_line(name: &str, input: &Value) -> String {
+    let key = match name {
+        "Bash" => "command",
+        "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => "file_path",
+        "Grep" | "Glob" => "pattern",
+        "WebSearch" => "query",
+        "WebFetch" => "url",
+        "Task" | "Agent" => "description",
+        _ => "",
+    };
+    let summary = s(input, key).map(|x| x.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|x| !x.is_empty());
+    match summary {
+        Some(x) => format!("[{name}] {}", crate::util::truncate(&x, 160)),
+        None => format!("[{name}]"),
+    }
+}
+
 pub fn tool_call(call_id: &str, name: &str, detail: Value, status: &str, error: Option<String>) -> Value {
     let error = match (status, error) {
         ("failed", Some(e)) => Value::String(clip(&e)),

@@ -27,7 +27,12 @@ pub struct StreamState {
     limit_refused: Option<Option<u64>>,
     /// A sub-agent of the running turn stopped on the usage or rate limit.
     sub_limited: bool,
+    /// Task tool_use_id -> the running sub-agent's action log.
+    sub_logs: HashMap<String, Vec<String>>,
 }
+
+/// Lines kept in a running sub-agent's log (the oldest are dropped).
+const MAX_SUB_LOG_LINES: usize = 50;
 
 fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|x| x.to_string())
@@ -35,7 +40,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -74,7 +79,10 @@ impl StreamState {
             }
             "stream_event" if !is_sidechain => self.handle_stream_event(msg.get("event").unwrap_or(&Value::Null)),
             "assistant" if !is_sidechain => self.handle_assistant(&msg),
-            "assistant" => self.sub_limited |= is_limit_message(&msg),
+            "assistant" => {
+                self.sub_limited |= is_limit_message(&msg);
+                self.handle_sidechain(&msg);
+            }
             "user" if !is_sidechain => self.handle_tool_results(&msg),
             "rate_limit_event" => self.limit_info = msg.get("rate_limit_info").cloned(),
             "result" => self.handle_result(&msg),
@@ -153,6 +161,30 @@ impl StreamState {
         }
     }
 
+    /// A sub-agent's own message: list its tool calls on the parent Task card
+    /// while it runs, so the app shows what it is doing.
+    fn handle_sidechain(&mut self, msg: &Value) {
+        let Some(parent) = s(msg, "parent_tool_use_id") else { return };
+        let Some((name, input)) = self.tools.get(&parent) else { return };
+        let Some(blocks) = msg.pointer("/message/content").and_then(|c| c.as_array()) else { return };
+        let lines: Vec<String> = blocks
+            .iter()
+            .filter(|b| matches!(b.get("type").and_then(|t| t.as_str()), Some("tool_use" | "server_tool_use" | "mcp_tool_use")))
+            .map(|b| tools::claude_action_line(&s(b, "name").unwrap_or_else(|| "tool".into()), b.get("input").unwrap_or(&Value::Null)))
+            .collect();
+        if lines.is_empty() {
+            return;
+        }
+        let log = self.sub_logs.entry(parent.clone()).or_default();
+        log.extend(lines);
+        let excess = log.len().saturating_sub(MAX_SUB_LOG_LINES);
+        log.drain(..excess);
+        let mut detail = tools::claude_detail(name, input, None);
+        detail["log"] = json!(log.join("\n"));
+        let item = tools::tool_call(&parent, name, detail, "running", None);
+        self.timeline(item);
+    }
+
     fn handle_tool_results(&mut self, msg: &Value) {
         if let Some(summary) = failed_task_summary(msg.pointer("/message/content").unwrap_or(&Value::Null)) {
             self.sub_limited |= super::is_usage_limit(&summary);
@@ -164,6 +196,7 @@ impl StreamState {
             }
             let Some(id) = s(block, "tool_use_id") else { continue };
             let Some((name, input)) = self.tools.remove(&id) else { continue };
+            self.sub_logs.remove(&id);
             let output = match block.get("content") {
                 Some(Value::String(text)) => text.clone(),
                 Some(Value::Array(parts)) => parts.iter().filter_map(|p| s(p, "text")).collect::<Vec<_>>().join("\n"),
@@ -201,6 +234,7 @@ impl StreamState {
             let _ = self.events.send(ProviderEvent::Timeline { agent_id: agent_id.clone(), item: tools::tool_call(&id, &name, detail, "canceled", None) });
         }
         self.streamed.clear();
+        self.sub_logs.clear();
         let ok = s(msg, "subtype").as_deref() == Some("success") && !msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
         let error = || {
             msg.get("errors")
@@ -481,5 +515,28 @@ mod tests {
 
         // The next turn starts clean.
         assert_eq!(limit_of(&run(&[done])), None);
+    }
+
+    #[test]
+    fn subagent_actions_show_on_its_task_card() {
+        let task = json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "toolu_1", "name": "Task", "input": { "subagent_type": "Explore", "description": "Find it" } }] } });
+        let read = json!({ "type": "assistant", "parent_tool_use_id": "toolu_1", "message": { "content": [{ "type": "text", "text": "Looking" }, { "type": "tool_use", "id": "toolu_s1", "name": "Read", "input": { "file_path": "/src/main.rs" } }] } });
+        let grep = json!({ "type": "assistant", "parent_tool_use_id": "toolu_1", "message": { "content": [{ "type": "tool_use", "id": "toolu_s2", "name": "Grep", "input": { "pattern": "fn  main" } }] } });
+        let result = json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "Found it." }] } });
+        let items: Vec<Value> = run(&[task, read, grep, result])
+            .into_iter()
+            .filter_map(|e| match e {
+                ProviderEvent::Timeline { item, .. } => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().all(|i| i["callId"] == "toolu_1"));
+        assert_eq!(items[1]["status"], "running");
+        assert_eq!(items[1]["detail"]["log"], "[Read] /src/main.rs");
+        assert_eq!(items[2]["detail"]["log"], "[Read] /src/main.rs\n[Grep] fn main");
+        assert_eq!(items[2]["detail"]["subAgentType"], "Explore");
+        assert_eq!(items[3]["status"], "completed");
+        assert_eq!(items[3]["detail"]["log"], "Found it.");
     }
 }
