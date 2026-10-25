@@ -29,10 +29,14 @@ pub struct StreamState {
     sub_limited: bool,
     /// Task tool_use_id -> the running sub-agent's action log.
     sub_logs: HashMap<String, Vec<String>>,
+    /// Task tool_use_id -> (name, input) of sub-agents running in the background.
+    background: HashMap<String, (String, Value)>,
 }
 
 /// Lines kept in a running sub-agent's log (the oldest are dropped).
 const MAX_SUB_LOG_LINES: usize = 50;
+/// Background sub-agents tracked at once.
+const MAX_BACKGROUND: usize = 32;
 
 fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|x| x.to_string())
@@ -40,7 +44,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -161,11 +165,24 @@ impl StreamState {
         }
     }
 
+    /// A Task card whose log is the sub-agent's actions so far.
+    fn sub_agent_card(&self, id: &str, name: &str, input: &Value, status: &str) -> Value {
+        let mut detail = tools::claude_detail(name, input, None);
+        detail["log"] = json!(self.sub_logs.get(id).map(|l| l.join("\n")).unwrap_or_default());
+        tools::tool_call(id, name, detail, status, None)
+    }
+
     /// A sub-agent's own message: list its tool calls on the parent Task card
-    /// while it runs, so the app shows what it is doing.
+    /// while it runs (in the foreground or the background), so the app shows
+    /// what it is doing.
     fn handle_sidechain(&mut self, msg: &Value) {
         let Some(parent) = s(msg, "parent_tool_use_id") else { return };
-        let Some((name, input)) = self.tools.get(&parent) else { return };
+        // A background agent's Task call is already answered; its card keeps that status.
+        let (status, (name, input)) = match (self.tools.get(&parent), self.background.get(&parent)) {
+            (Some(t), _) => ("running", t.clone()),
+            (None, Some(t)) => ("completed", t.clone()),
+            (None, None) => return,
+        };
         let Some(blocks) = msg.pointer("/message/content").and_then(|c| c.as_array()) else { return };
         let lines: Vec<String> = blocks
             .iter()
@@ -179,16 +196,35 @@ impl StreamState {
         log.extend(lines);
         let excess = log.len().saturating_sub(MAX_SUB_LOG_LINES);
         log.drain(..excess);
-        let mut detail = tools::claude_detail(name, input, None);
-        detail["log"] = json!(log.join("\n"));
-        let item = tools::tool_call(&parent, name, detail, "running", None);
-        self.timeline(item);
+        self.timeline(self.sub_agent_card(&parent, &name, &input, status));
+    }
+
+    /// Background sub-agents that reported back (`<task-notification>`): their
+    /// cards get the final result.
+    fn finish_background(&mut self, content: &Value) {
+        let text = content_text(content);
+        for note in text.split("<task-notification>").skip(1) {
+            let Some(id) = tag(note, "tool-use-id") else { continue };
+            let Some((name, input)) = self.background.remove(&id) else { continue };
+            self.sub_logs.remove(&id);
+            let summary = tag(note, "summary").unwrap_or_default();
+            let result = tag(note, "result").unwrap_or_else(|| summary.clone());
+            let detail = tools::claude_detail(&name, &input, Some(&result));
+            let item = match tag(note, "status").as_deref() {
+                Some("completed") => tools::tool_call(&id, &name, detail, "completed", None),
+                Some("failed") => tools::tool_call(&id, &name, detail, "failed", Some(summary)),
+                _ => tools::tool_call(&id, &name, detail, "canceled", None),
+            };
+            self.timeline(item);
+        }
     }
 
     fn handle_tool_results(&mut self, msg: &Value) {
-        if let Some(summary) = failed_task_summary(msg.pointer("/message/content").unwrap_or(&Value::Null)) {
+        let content = msg.pointer("/message/content").unwrap_or(&Value::Null);
+        if let Some(summary) = failed_task_summary(content) {
             self.sub_limited |= super::is_usage_limit(&summary);
         }
+        self.finish_background(content);
         let Some(blocks) = msg.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array()) else { return };
         for block in blocks {
             if !block.get("type").and_then(|t| t.as_str()).map(|t| t.ends_with("tool_result")).unwrap_or(false) {
@@ -196,13 +232,18 @@ impl StreamState {
             }
             let Some(id) = s(block, "tool_use_id") else { continue };
             let Some((name, input)) = self.tools.remove(&id) else { continue };
-            self.sub_logs.remove(&id);
-            let output = match block.get("content") {
-                Some(Value::String(text)) => text.clone(),
-                Some(Value::Array(parts)) => parts.iter().filter_map(|p| s(p, "text")).collect::<Vec<_>>().join("\n"),
-                _ => String::new(),
-            };
+            let output = content_text(block.get("content").unwrap_or(&Value::Null));
             let failed = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+            if matches!(name.as_str(), "Task" | "Agent") && !failed && output.starts_with("Async agent launched") {
+                // It runs on in the background: the card keeps listing what it
+                // does until its notification (the launch text is internal).
+                self.timeline(self.sub_agent_card(&id, &name, &input, "completed"));
+                if self.background.len() < MAX_BACKGROUND {
+                    self.background.insert(id, (name, input));
+                }
+                continue;
+            }
+            self.sub_logs.remove(&id);
             // A sub-agent that died on the limit reports it as its result.
             if matches!(name.as_str(), "Task" | "Agent") && output.len() < 2000 && output.contains("API Error") && super::is_usage_limit(&output) {
                 self.sub_limited = true;
@@ -234,7 +275,9 @@ impl StreamState {
             let _ = self.events.send(ProviderEvent::Timeline { agent_id: agent_id.clone(), item: tools::tool_call(&id, &name, detail, "canceled", None) });
         }
         self.streamed.clear();
-        self.sub_logs.clear();
+        // Background sub-agents outlive the turn that launched them.
+        let background = &self.background;
+        self.sub_logs.retain(|id, _| background.contains_key(id));
         let ok = s(msg, "subtype").as_deref() == Some("success") && !msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
         let error = || {
             msg.get("errors")
@@ -355,16 +398,26 @@ fn is_limit_message(msg: &Value) -> bool {
 /// The summary of a background sub-agent's `<task-notification>` that says
 /// it failed ("Agent \"...\" failed: Agent terminated early due to an API error: ...").
 fn failed_task_summary(content: &Value) -> Option<String> {
-    let text = match content {
-        Value::String(t) => t.clone(),
-        Value::Array(parts) => parts.iter().filter_map(|p| s(p, "text")).collect::<Vec<_>>().join("\n"),
-        _ => return None,
-    };
+    let text = content_text(content);
     if !text.contains("<task-notification>") || !text.contains("<status>failed</status>") {
         return None;
     }
-    let (_, rest) = text.split_once("<summary>")?;
-    rest.split_once("</summary>").map(|(summary, _)| summary.to_string())
+    tag(&text, "summary")
+}
+
+/// The text of message or tool-result content (a string or text parts).
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(t) => t.clone(),
+        Value::Array(parts) => parts.iter().filter_map(|p| s(p, "text")).collect::<Vec<_>>().join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// The text inside the first `<name>…</name>` of a notification.
+fn tag(text: &str, name: &str) -> Option<String> {
+    let (_, rest) = text.split_once(&format!("<{name}>"))?;
+    rest.split_once(&format!("</{name}>")).map(|(inner, _)| inner.trim().to_string())
 }
 
 /// AskUserQuestion leaves "Other" to the host; the app shows its free-text
@@ -538,5 +591,35 @@ mod tests {
         assert_eq!(items[2]["detail"]["subAgentType"], "Explore");
         assert_eq!(items[3]["status"], "completed");
         assert_eq!(items[3]["detail"]["log"], "Found it.");
+    }
+
+    #[test]
+    fn background_subagent_card_follows_it_until_it_reports() {
+        let timeline = |events: Vec<ProviderEvent>| -> Vec<Value> {
+            events
+                .into_iter()
+                .filter_map(|e| match e {
+                    ProviderEvent::Timeline { item, .. } => Some(item),
+                    _ => None,
+                })
+                .collect()
+        };
+        let task = json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "toolu_1", "name": "Agent", "input": { "description": "Port it", "run_in_background": true } }] } });
+        let launched = json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": [{ "type": "text", "text": "Async agent launched successfully. (internal)\nagentId: a123" }] }] } });
+        let done = json!({ "type": "result", "subtype": "success", "result": "Started." });
+        let bash = json!({ "type": "assistant", "parent_tool_use_id": "toolu_1", "message": { "content": [{ "type": "tool_use", "id": "toolu_s1", "name": "Bash", "input": { "command": "ls src" } }] } });
+        let note = "<task-notification>\n<task-id>a123</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Port it\" finished</summary>\n<result>Ported.</result>\n<usage><tool_uses>1</tool_uses></usage>\n</task-notification>";
+        let notified = json!({ "type": "user", "message": { "content": note } });
+        let items = timeline(run(&[task, launched, done, bash, notified]));
+        assert_eq!(items.len(), 4);
+        // The launch answer is internal metadata: the card shows no log yet.
+        assert_eq!(items[1]["status"], "completed");
+        assert_eq!(items[1]["detail"]["log"], "");
+        // After the turn ended, the agent's actions still reach its card.
+        assert_eq!(items[2]["callId"], "toolu_1");
+        assert_eq!(items[2]["detail"]["log"], "[Bash] ls src");
+        // Its notification puts the final result on the card.
+        assert_eq!(items[3]["status"], "completed");
+        assert_eq!(items[3]["detail"]["log"], "Ported.");
     }
 }

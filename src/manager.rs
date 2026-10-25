@@ -1165,6 +1165,9 @@ impl Manager {
                         a.produced = true;
                     }
                     self.buffer_chunk(&agent_id, item);
+                } else if item.pointer("/detail/type").and_then(|t| t.as_str()) == Some("sub_agent") && self.agents.contains_key(&agent_id) {
+                    // A background sub-agent's card keeps updating after the turn that launched it.
+                    self.append_item(&agent_id, item);
                 }
             }
             ProviderEvent::Permission { agent_id, request, reply } => {
