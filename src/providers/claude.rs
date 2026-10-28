@@ -13,13 +13,13 @@
 //! With `claude_keep_warm` the idle child is never reaped, and the manager
 //! pre-starts one (`prewarm`) so the next prompt skips the cold start.
 
-use super::claude_stream::{StreamState, SubAgents};
+use super::claude_stream::{StreamState, SubAgents, SUBAGENT_HOOK};
 use super::{AgentSpec, EventTx, ProviderEvent};
 use crate::config::Config;
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -60,11 +60,24 @@ pub struct ClaudePool {
     waiting: VecDeque<(AgentSpec, String)>,
     generation: u64,
     max_live: usize,
+    /// Sub-agents each process may run at once, shared with every stream
+    /// reader's gate (0 while the machine is strained).
+    sub_cap: Arc<AtomicUsize>,
 }
 
 impl ClaudePool {
     pub fn new(cfg: Config, events: EventTx) -> Self {
-        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1 }
+        let sub_cap = Arc::new(AtomicUsize::new(cfg.claude_max_subagents));
+        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap }
+    }
+
+    /// How many sub-agents a process may start now: the configured cap, or
+    /// none while the machine is strained (running ones carry on).
+    pub fn set_strained(&self, strained: bool) {
+        let cap = if strained { 0 } else { self.cfg.claude_max_subagents };
+        if self.sub_cap.swap(cap, Ordering::Relaxed) != cap {
+            crate::log!("claude: up to {cap} sub-agent(s) per agent");
+        }
     }
 
     pub fn live_count(&self) -> usize {
@@ -219,7 +232,9 @@ impl ClaudePool {
         if spec.session_id.is_none() {
             let _ = self.events.send(ProviderEvent::SessionStarted { agent_id: spec.id.clone(), session_id: session_id.clone() });
         }
-        let init = json!({ "type": "control_request", "request_id": format!("init-{generation}"), "request": { "subtype": "initialize", "hooks": null } });
+        // Every sub-agent launch asks the daemon first (claude_stream's gate).
+        let hooks = json!({ "PreToolUse": [{ "matcher": "Agent|Task", "hookCallbackIds": [SUBAGENT_HOOK] }] });
+        let init = json!({ "type": "control_request", "request_id": format!("init-{generation}"), "request": { "subtype": "initialize", "hooks": hooks } });
         let _ = in_tx.send(init.to_string());
 
         tokio::spawn(async move {
@@ -254,6 +269,7 @@ impl ClaudePool {
 
         let mut state = StreamState::new(spec.id.clone(), self.events.clone(), in_tx.clone(), interrupted.clone(), Some(session_id));
         let sub_active = state.sub_active.clone();
+        state.sub_cap = self.sub_cap.clone();
         let events = self.events.clone();
         let agent_id = spec.id.clone();
         tokio::spawn(async move {

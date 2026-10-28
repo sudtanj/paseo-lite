@@ -10,8 +10,9 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = "You are running on a low-resource VM (f
 
 /// Added for Claude Code only (after the prompts above). Sub-agents run inside
 /// the agent's own `claude` process, so they are the cheap way to work in
-/// parallel on a machine that fits one process.
-pub const CLAUDE_SUBAGENT_PROMPT: &str = "This machine usually fits only one Claude Code process at a time, so other chats wait in a queue, but sub-agents run inside your own process and cost little extra memory. When a task splits into independent parts (separate files or modules, separate questions to research, a review alongside the implementation), run them in parallel as sub-agents with the Agent tool, in the background while you keep working, instead of doing them one after another. Give each one a narrow, self-contained brief that names the files to look at. Do small tasks yourself, keep it to a few sub-agents at once, and make sure they follow the same rules about not running heavy commands.";
+/// parallel on a machine that fits one process. Handing work off and ending
+/// the turn keeps the chat free for the user's next instruction.
+pub const CLAUDE_SUBAGENT_PROMPT: &str = "This machine usually fits only one Claude Code process at a time, so other chats wait in a queue, but sub-agents run inside your own process and cost little extra memory. Keep yourself free for the user: when a task takes more than a few quick steps, or splits into independent parts (separate files or modules, separate questions to research, a review of finished work), hand it to sub-agents with the Agent tool and `run_in_background: true`, each with a narrow, self-contained brief that names the files to look at, then reply in a line or two with what is running and end your turn. Do not wait, sleep or poll for them: each result arrives as a notification that starts a new turn, where you check it and report back briefly. The user may send new instructions while they run; act on those right away, and never let two sub-agents, or a sub-agent and you, change the same files at once. Do small tasks yourself. The daemon limits how many sub-agents run at once and starts none while memory is low; when a launch is refused, follow the reason it gives. Tell each sub-agent the same rules about not running heavy commands.";
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -92,6 +93,9 @@ pub struct Config {
     /// Added to Claude Code agents only: use sub-agents for parallel work.
     /// `PASEO_CLAUDE_SUBAGENT_PROMPT` overrides it, an empty string disables it.
     pub claude_subagent_prompt: Option<String>,
+    /// Sub-agents one Claude Code agent may run at once (foreground or
+    /// background); further launches are refused until one reports back.
+    pub claude_max_subagents: usize,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -178,6 +182,7 @@ impl Config {
                 Ok(v) => Some(v),
                 Err(_) => Some(CLAUDE_SUBAGENT_PROMPT.to_string()),
             },
+            claude_max_subagents: env("PASEO_CLAUDE_MAX_SUBAGENTS").and_then(|v| v.parse().ok()).unwrap_or(3),
         }
     }
 }

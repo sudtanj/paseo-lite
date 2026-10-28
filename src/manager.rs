@@ -674,6 +674,8 @@ impl Manager {
                 crate::warn!("capacity: released {freed} idle claude process(es) to free memory");
             }
         }
+        // Sub-agents share their agent's process: under pressure no new ones start.
+        self.claude.set_strained(self.capacity.strained());
         let max = self.slots("claude");
         if max != self.claude.max_live() {
             let ready = self.claude.set_max_live(max);

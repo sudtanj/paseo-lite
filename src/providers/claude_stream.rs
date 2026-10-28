@@ -4,7 +4,7 @@ use super::tools;
 use super::{EventTx, ProviderEvent};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
@@ -35,7 +35,19 @@ pub struct StreamState {
     /// Whether background sub-agents are running and when they last showed
     /// activity. The pool keeps the process alive while they work.
     pub sub_active: Arc<Mutex<SubAgents>>,
+    /// How many sub-agents may run at once, set by the pool from the
+    /// machine's state (0 = start no new ones).
+    pub sub_cap: Arc<AtomicUsize>,
+    /// Sub-agent launches the gate let through, and when.
+    admitted: HashMap<String, Instant>,
 }
+
+/// The `PreToolUse` hook callback id the daemon registers for Agent/Task
+/// calls, so it decides how many sub-agents run at once.
+pub const SUBAGENT_HOOK: &str = "paseo-subagent-gate";
+/// An admitted launch counts as running this long even before its Task call
+/// shows up in the stream.
+const ADMIT_GRACE: Duration = Duration::from_secs(30);
 
 /// Lines kept in a running sub-agent's log (the oldest are dropped).
 const MAX_SUB_LOG_LINES: usize = 50;
@@ -69,7 +81,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -238,6 +250,7 @@ impl StreamState {
         self.emit(ProviderEvent::BackgroundTurn { agent_id: self.agent_id.clone() });
         for note in text.split("<task-notification>").skip(1) {
             let Some(id) = tag(note, "tool-use-id") else { continue };
+            self.admitted.remove(&id);
             let Some((name, input)) = self.background.remove(&id) else { continue };
             self.sub_logs.remove(&id);
             let summary = tag(note, "summary").unwrap_or_default();
@@ -291,6 +304,7 @@ impl StreamState {
                 continue;
             }
             self.sub_logs.remove(&id);
+            self.admitted.remove(&id);
             // A sub-agent that died on the limit reports it as its result.
             if matches!(name.as_str(), "Task" | "Agent") && output.len() < 2000 && output.contains("API Error") && super::is_usage_limit(&output) {
                 self.sub_limited = true;
@@ -372,9 +386,38 @@ impl StreamState {
         Some(refused.flatten().or(event_reset).or_else(|| super::reset_in_text(&text)).or_else(|| super::reset_in_text(error)))
     }
 
+    /// The `PreToolUse` hook for Agent/Task: let a sub-agent start while fewer
+    /// than `sub_cap` are running (foreground or background), else deny it
+    /// with a reason the model can act on. Deny wins over every permission
+    /// mode, Bypass included.
+    fn gate_subagent(&mut self, req: &Value) -> Value {
+        let now = Instant::now();
+        let (tools, background) = (&self.tools, &self.background);
+        self.admitted.retain(|id, at| tools.contains_key(id) || background.contains_key(id) || now.duration_since(*at) < ADMIT_GRACE);
+        let cap = self.sub_cap.load(Ordering::Relaxed);
+        let running = self.admitted.len();
+        if running < cap {
+            let id = s(req, "tool_use_id").or_else(|| req.get("input").and_then(|i| s(i, "tool_use_id"))).unwrap_or_else(crate::util::new_id);
+            self.admitted.insert(id, now);
+            return json!({});
+        }
+        let reason = if cap == 0 {
+            "Sub-agent not started: the machine is low on memory or CPU right now. Do this part yourself if it is small; otherwise tell the user it is on hold and launch it after a running sub-agent reports back or in a later turn.".to_string()
+        } else {
+            format!("Sub-agent not started: {running} sub-agent(s) are already running, the most this machine allows at once. Launch it after one of them reports back (its notification starts a new turn), or do this part yourself if it is small. Do not wait or poll for them.")
+        };
+        crate::log!("claude {}: sub-agent launch refused ({running} running, cap {cap})", self.agent_id);
+        json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })
+    }
+
     fn handle_control_request(&mut self, msg: &Value) {
         let Some(request_id) = s(msg, "request_id") else { return };
         let req = msg.get("request").cloned().unwrap_or(Value::Null);
+        if s(&req, "subtype").as_deref() == Some("hook_callback") && s(&req, "callback_id").as_deref() == Some(SUBAGENT_HOOK) {
+            let resp = json!({ "type": "control_response", "response": { "subtype": "success", "request_id": request_id, "response": self.gate_subagent(&req) } });
+            let _ = self.stdin.send(resp.to_string());
+            return;
+        }
         if s(&req, "subtype").as_deref() != Some("can_use_tool") {
             // Unknown host callbacks (hooks, MCP) are answered with an error so the CLI never stalls.
             let resp = json!({ "type": "control_response", "response": { "subtype": "error", "request_id": request_id, "error": "unsupported" } });
@@ -690,5 +733,38 @@ mod tests {
         let last = timeline(events).pop().expect("a card");
         assert_eq!(last["status"], "failed");
         assert_eq!(last["detail"]["log"], "[Bash] ls src");
+    }
+
+    #[test]
+    fn subagent_gate_caps_running_subagents() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (stdin, mut out) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        st.sub_cap.store(2, Ordering::Relaxed);
+        let mut gate = |st: &mut StreamState, id: &str| -> Value {
+            let hook = json!({ "type": "control_request", "request_id": format!("r-{id}"), "request": { "subtype": "hook_callback", "callback_id": SUBAGENT_HOOK, "input": { "hook_event_name": "PreToolUse", "tool_name": "Agent" }, "tool_use_id": id } });
+            st.handle_line(&hook.to_string());
+            let resp: Value = serde_json::from_str(&out.try_recv().expect("an answer")).unwrap();
+            assert_eq!(resp["response"]["request_id"], format!("r-{id}"));
+            resp["response"]["response"].clone()
+        };
+        let denied = |v: &Value| v.pointer("/hookSpecificOutput/permissionDecision").and_then(|d| d.as_str()) == Some("deny");
+        let launch = |st: &mut StreamState, id: &str| {
+            st.handle_line(&json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": "Agent", "input": { "description": "Part", "run_in_background": true } }] } }).to_string());
+            st.handle_line(&json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": "Async agent launched successfully." }] } }).to_string());
+        };
+        assert!(!denied(&gate(&mut st, "t1")));
+        launch(&mut st, "t1");
+        assert!(!denied(&gate(&mut st, "t2")));
+        launch(&mut st, "t2");
+        // Two running: the third waits.
+        assert!(denied(&gate(&mut st, "t3")));
+        // One reports back: its slot is free again.
+        let note = "<task-notification>\n<tool-use-id>t1</tool-use-id>\n<status>completed</status>\n<result>Done.</result>\n</task-notification>";
+        st.handle_line(&json!({ "type": "user", "message": { "content": note } }).to_string());
+        assert!(!denied(&gate(&mut st, "t3")));
+        // Under pressure no new sub-agent starts, whatever is running.
+        st.sub_cap.store(0, Ordering::Relaxed);
+        assert!(denied(&gate(&mut st, "t4")));
     }
 }
