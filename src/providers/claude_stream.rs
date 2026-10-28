@@ -5,7 +5,8 @@ use super::{EventTx, ProviderEvent};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 pub struct StreamState {
@@ -31,12 +32,36 @@ pub struct StreamState {
     sub_logs: HashMap<String, Vec<String>>,
     /// Task tool_use_id -> (name, input) of sub-agents running in the background.
     background: HashMap<String, (String, Value)>,
+    /// Whether background sub-agents are running and when they last showed
+    /// activity. The pool keeps the process alive while they work.
+    pub sub_active: Arc<Mutex<SubAgents>>,
 }
 
 /// Lines kept in a running sub-agent's log (the oldest are dropped).
 const MAX_SUB_LOG_LINES: usize = 50;
 /// Background sub-agents tracked at once.
 const MAX_BACKGROUND: usize = 32;
+/// A background sub-agent silent for this long is taken for hung: its
+/// process may then be reaped or evicted like any idle one.
+const SUBAGENT_QUIET_MAX: Duration = Duration::from_secs(30 * 60);
+/// Kept after the last sub-agent reports, while the manager opens the turn
+/// the CLI runs on its result.
+const SUBAGENT_GRACE: Duration = Duration::from_secs(15);
+
+/// A process's background sub-agents, as the pool sees them.
+#[derive(Default)]
+pub struct SubAgents {
+    pub running: bool,
+    pub last_seen: Option<Instant>,
+}
+
+impl SubAgents {
+    /// Whether the process must stay up for them.
+    pub fn holding(&self) -> bool {
+        let quiet = self.last_seen.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
+        quiet < if self.running { SUBAGENT_QUIET_MAX } else { SUBAGENT_GRACE }
+    }
+}
 
 fn s(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|x| x.to_string())
@@ -44,7 +69,7 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
@@ -165,6 +190,11 @@ impl StreamState {
         }
     }
 
+    /// Tell the pool whether background sub-agents are still at work.
+    fn note_background(&self) {
+        *self.sub_active.lock().unwrap() = SubAgents { running: !self.background.is_empty(), last_seen: Some(Instant::now()) };
+    }
+
     /// A Task card whose log is the sub-agent's actions so far.
     fn sub_agent_card(&self, id: &str, name: &str, input: &Value, status: &str) -> Value {
         let mut detail = tools::claude_detail(name, input, None);
@@ -177,12 +207,10 @@ impl StreamState {
     /// what it is doing.
     fn handle_sidechain(&mut self, msg: &Value) {
         let Some(parent) = s(msg, "parent_tool_use_id") else { return };
-        // A background agent's Task call is already answered; its card keeps that status.
-        let (status, (name, input)) = match (self.tools.get(&parent), self.background.get(&parent)) {
-            (Some(t), _) => ("running", t.clone()),
-            (None, Some(t)) => ("completed", t.clone()),
-            (None, None) => return,
-        };
+        let Some((name, input)) = self.tools.get(&parent).or_else(|| self.background.get(&parent)).cloned() else { return };
+        if self.background.contains_key(&parent) {
+            self.note_background();
+        }
         let Some(blocks) = msg.pointer("/message/content").and_then(|c| c.as_array()) else { return };
         let lines: Vec<String> = blocks
             .iter()
@@ -196,13 +224,18 @@ impl StreamState {
         log.extend(lines);
         let excess = log.len().saturating_sub(MAX_SUB_LOG_LINES);
         log.drain(..excess);
-        self.timeline(self.sub_agent_card(&parent, &name, &input, status));
+        self.timeline(self.sub_agent_card(&parent, &name, &input, "running"));
     }
 
     /// Background sub-agents that reported back (`<task-notification>`): their
-    /// cards get the final result.
+    /// cards get the final result. The CLI then runs a turn of its own on
+    /// them, which the manager is told to open.
     fn finish_background(&mut self, content: &Value) {
         let text = content_text(content);
+        if !text.contains("<task-notification>") {
+            return;
+        }
+        self.emit(ProviderEvent::BackgroundTurn { agent_id: self.agent_id.clone() });
         for note in text.split("<task-notification>").skip(1) {
             let Some(id) = tag(note, "tool-use-id") else { continue };
             let Some((name, input)) = self.background.remove(&id) else { continue };
@@ -217,6 +250,19 @@ impl StreamState {
             };
             self.timeline(item);
         }
+        self.note_background();
+    }
+
+    /// The process is gone and the background sub-agents it was running died
+    /// with it: fail their cards instead of leaving them running.
+    pub fn process_ended(&mut self, killed: bool) {
+        let error = if killed { "Stopped before it reported back: its Claude Code process was shut down" } else { "Stopped before it reported back: its Claude Code process exited" };
+        for (id, (name, input)) in std::mem::take(&mut self.background) {
+            let mut detail = tools::claude_detail(&name, &input, None);
+            detail["log"] = json!(self.sub_logs.remove(&id).map(|l| l.join("\n")).unwrap_or_default());
+            self.timeline(tools::tool_call(&id, &name, detail, "failed", Some(error.into())));
+        }
+        self.note_background();
     }
 
     fn handle_tool_results(&mut self, msg: &Value) {
@@ -237,9 +283,10 @@ impl StreamState {
             if matches!(name.as_str(), "Task" | "Agent") && !failed && output.starts_with("Async agent launched") {
                 // It runs on in the background: the card keeps listing what it
                 // does until its notification (the launch text is internal).
-                self.timeline(self.sub_agent_card(&id, &name, &input, "completed"));
+                self.timeline(self.sub_agent_card(&id, &name, &input, "running"));
                 if self.background.len() < MAX_BACKGROUND {
                     self.background.insert(id, (name, input));
+                    self.note_background();
                 }
                 continue;
             }
@@ -610,16 +657,38 @@ mod tests {
         let bash = json!({ "type": "assistant", "parent_tool_use_id": "toolu_1", "message": { "content": [{ "type": "tool_use", "id": "toolu_s1", "name": "Bash", "input": { "command": "ls src" } }] } });
         let note = "<task-notification>\n<task-id>a123</task-id>\n<tool-use-id>toolu_1</tool-use-id>\n<status>completed</status>\n<summary>Agent \"Port it\" finished</summary>\n<result>Ported.</result>\n<usage><tool_uses>1</tool_uses></usage>\n</task-notification>";
         let notified = json!({ "type": "user", "message": { "content": note } });
-        let items = timeline(run(&[task, launched, done, bash, notified]));
+        let events = run(&[task.clone(), launched.clone(), done, bash.clone(), notified]);
+        // The CLI acts on the notification in a turn of its own.
+        assert!(events.iter().any(|e| matches!(e, ProviderEvent::BackgroundTurn { .. })));
+        let items = timeline(events);
         assert_eq!(items.len(), 4);
         // The launch answer is internal metadata: the card shows no log yet.
-        assert_eq!(items[1]["status"], "completed");
+        assert_eq!(items[1]["status"], "running");
         assert_eq!(items[1]["detail"]["log"], "");
         // After the turn ended, the agent's actions still reach its card.
         assert_eq!(items[2]["callId"], "toolu_1");
+        assert_eq!(items[2]["status"], "running");
         assert_eq!(items[2]["detail"]["log"], "[Bash] ls src");
         // Its notification puts the final result on the card.
         assert_eq!(items[3]["status"], "completed");
         assert_eq!(items[3]["detail"]["log"], "Ported.");
+
+        // A process that exits first fails the cards of the agents it was running.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        for line in [task, launched, bash] {
+            st.handle_line(&line.to_string());
+        }
+        assert!(st.sub_active.lock().unwrap().running);
+        st.process_ended(true);
+        assert!(!st.sub_active.lock().unwrap().running);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let last = timeline(events).pop().expect("a card");
+        assert_eq!(last["status"], "failed");
+        assert_eq!(last["detail"]["log"], "[Bash] ls src");
     }
 }

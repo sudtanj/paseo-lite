@@ -4,6 +4,7 @@
 //! life. Here a child exists only while it is useful:
 //! - spawned on the first prompt (with `--resume` when the session exists),
 //! - kept warm for `claude_idle` after a turn so follow-ups are instant,
+//!   and for as long as background sub-agents are still working in it,
 //! - then its stdin is closed and it exits, freeing all of its memory.
 //! At most `max_live` children run at once across all projects: the fixed
 //! `claude_max_live`, or the manager's auto capacity (one on a small machine).
@@ -12,7 +13,7 @@
 //! With `claude_keep_warm` the idle child is never reaped, and the manager
 //! pre-starts one (`prewarm`) so the next prompt skips the cold start.
 
-use super::claude_stream::StreamState;
+use super::claude_stream::{StreamState, SubAgents};
 use super::{AgentSpec, EventTx, ProviderEvent};
 use crate::config::Config;
 use serde_json::json;
@@ -32,8 +33,18 @@ struct Proc {
     last_used: Instant,
     generation: u64,
     interrupted: Arc<AtomicBool>,
+    /// Its background sub-agents, updated by the stream reader.
+    sub_active: Arc<std::sync::Mutex<SubAgents>>,
     /// Spawn flags (model, effort) changed mid-turn: restart once the turn ends.
     restart: bool,
+}
+
+impl Proc {
+    /// Idle between turns, but its background sub-agents are still working:
+    /// stopping it would kill them.
+    fn holding(&self) -> bool {
+        self.sub_active.lock().unwrap().holding()
+    }
 }
 
 pub enum SendOutcome {
@@ -150,7 +161,7 @@ impl ClaudePool {
     }
 
     fn evict_one_idle(&mut self) -> bool {
-        let victim = self.procs.iter().filter(|(_, p)| !p.busy).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
+        let victim = self.procs.iter().filter(|(_, p)| !p.busy && !p.holding()).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
         match victim {
             Some(id) => {
                 self.stop(&id);
@@ -183,8 +194,9 @@ impl ClaudePool {
         if let Some(effort) = spec.thinking.as_deref().filter(|e| !e.is_empty() && *e != "default") {
             cmd.args(["--effort", effort]);
         }
-        if let Some(prompt) = spec.system_prompt.as_deref().filter(|p| !p.is_empty()) {
-            cmd.args(["--append-system-prompt", prompt]);
+        let prompt: Vec<&str> = [spec.system_prompt.as_deref(), self.cfg.claude_subagent_prompt.as_deref()].into_iter().flatten().filter(|p| !p.trim().is_empty()).collect();
+        if !prompt.is_empty() {
+            cmd.args(["--append-system-prompt", prompt.join("\n\n").as_str()]);
         }
         // Skip telemetry, error reporting and update checks: they only cost
         // egress here (the binary is pinned in the image). Set it in the
@@ -241,11 +253,13 @@ impl ClaudePool {
         });
 
         let mut state = StreamState::new(spec.id.clone(), self.events.clone(), in_tx.clone(), interrupted.clone(), Some(session_id));
+        let sub_active = state.sub_active.clone();
         let events = self.events.clone();
         let agent_id = spec.id.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut kill_rx = kill_rx;
+            let mut killed = false;
             loop {
                 tokio::select! {
                     line = lines.next_line() => match line {
@@ -254,10 +268,12 @@ impl ClaudePool {
                     },
                     _ = &mut kill_rx => {
                         let _ = child.start_kill();
+                        killed = true;
                         break;
                     }
                 }
             }
+            state.process_ended(killed);
             let status = child.wait().await.ok();
             let tail = stderr_tail.lock().unwrap().trim().to_string();
             if status.map(|s| !s.success()).unwrap_or(false) && !tail.is_empty() {
@@ -266,7 +282,7 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, restart: false });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, sub_active, restart: false });
         Ok(())
     }
 
@@ -356,23 +372,36 @@ impl ClaudePool {
         }
     }
 
-    /// Reap children idle past the keep-warm window.
-    pub fn reap(&mut self) {
-        if self.cfg.claude_keep_warm {
-            return;
+    /// Reap children idle past the keep-warm window (not while background
+    /// sub-agents work in them). Returns waiting prompts that may now start,
+    /// as a child whose sub-agents finished frees its slot here.
+    pub fn reap(&mut self) -> Vec<(AgentSpec, String)> {
+        if !self.cfg.claude_keep_warm {
+            let idle = self.cfg.claude_idle;
+            let stale: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy && !p.holding() && p.last_used.elapsed() >= idle).map(|(id, _)| id.clone()).collect();
+            for id in stale {
+                crate::log!("claude idle for agent {id}; releasing process");
+                self.stop(&id);
+            }
         }
-        let idle = self.cfg.claude_idle;
-        let stale: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy && p.last_used.elapsed() >= idle).map(|(id, _)| id.clone()).collect();
-        for id in stale {
-            crate::log!("claude idle for agent {id}; releasing process");
-            self.stop(&id);
-        }
+        self.drain_waiting()
     }
 
-    pub fn shutdown(&mut self) {
+    /// The CLI started a turn of its own (background sub-agents reported
+    /// back). False when the agent's process is already gone.
+    pub fn mark_busy(&mut self, agent_id: &str) -> bool {
+        let Some(p) = self.procs.get_mut(agent_id) else { return false };
+        p.busy = true;
+        p.last_used = Instant::now();
+        true
+    }
+
+    /// Stop every child. Returns how many were stopped.
+    pub fn shutdown(&mut self) -> usize {
         let ids: Vec<String> = self.procs.keys().cloned().collect();
-        for id in ids {
-            self.stop(&id);
+        for id in &ids {
+            self.stop(id);
         }
+        ids.len()
     }
 }

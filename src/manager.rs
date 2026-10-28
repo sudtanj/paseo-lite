@@ -59,6 +59,7 @@ fn other_event_agent(ev: &ProviderEvent) -> Option<&str> {
         | ProviderEvent::TurnFailed { agent_id, .. }
         | ProviderEvent::LimitHit { agent_id, .. }
         | ProviderEvent::TurnCanceled { agent_id, .. }
+        | ProviderEvent::BackgroundTurn { agent_id }
         | ProviderEvent::ProcessExited { agent_id, .. } => Some(agent_id),
     }
 }
@@ -267,13 +268,25 @@ impl Manager {
             }
             self.resolve_waiters();
         }
+        // Background sub-agents die with their processes: wait briefly for the
+        // failed cards, so they don't show as running after the restart.
+        let mut stopping = self.claude.shutdown();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while stopping > 0 {
+            match tokio::time::timeout_at(deadline, events.recv()).await {
+                Ok(Some(ProviderEvent::ProcessExited { .. })) => stopping -= 1,
+                Ok(Some(ProviderEvent::Timeline { agent_id, item })) if item.pointer("/detail/type").and_then(|t| t.as_str()) == Some("sub_agent") => self.append_item(&agent_id, item),
+                Ok(Some(_)) => {}
+                _ => break,
+            }
+        }
         self.flush_all();
-        self.claude.shutdown();
         self.codex.shutdown();
     }
 
     fn housekeeping(&mut self) {
-        self.claude.reap();
+        let ready = self.claude.reap();
+        self.send_ready(ready);
         self.codex.reap();
         self.update_capacity();
         self.keep_warm();
@@ -623,8 +636,15 @@ impl Manager {
             self.running.insert(id.clone());
             if cli == "codex" {
                 self.run_codex(spec, text);
-            } else if let SendOutcome::Failed(error) = self.claude.send(spec, text) {
-                self.finish_turn(&id, Err(error));
+            } else {
+                match self.claude.send(spec, text) {
+                    SendOutcome::Failed(error) => self.finish_turn(&id, Err(error)),
+                    SendOutcome::Queued => {
+                        let note = json!({ "type": "notification", "level": "info", "message": "Queued: waiting for another chat's Claude Code to finish (a turn or background sub-agents)" });
+                        self.append_item(&id, note);
+                    }
+                    SendOutcome::Started => {}
+                }
             }
         }
     }
@@ -673,6 +693,10 @@ impl Manager {
     fn send_ready(&mut self, ready: Vec<(AgentSpec, String)>) {
         for (spec, text) in ready {
             let id = spec.id.clone();
+            // The stall watchdog counts from when the prompt actually goes out.
+            if let Some(a) = self.agents.get_mut(&id) {
+                a.last_event = Instant::now();
+            }
             if let SendOutcome::Failed(e) = self.claude.send(spec, text) {
                 self.finish_turn(&id, Err(e));
             }
@@ -962,7 +986,9 @@ impl Manager {
                 let last = a.timeline.as_ref().and_then(|t| t.last())?;
                 let kind = last.item.get("type").and_then(|t| t.as_str());
                 let status = last.item.get("status").and_then(|t| t.as_str());
-                (kind == Some("tool_call") && matches!(status, Some("canceled") | Some("running"))).then(|| "the model stopped in the middle of a tool call".into())
+                // A sub-agent left running in the background is not a stop (retrying would kill it).
+                let background = status == Some("running") && last.item.pointer("/detail/type").and_then(|t| t.as_str()) == Some("sub_agent");
+                (kind == Some("tool_call") && matches!(status, Some("canceled") | Some("running")) && !background).then(|| "the model stopped in the middle of a tool call".into())
             }
             Ok(Some(_)) => None,
         }
@@ -1021,6 +1047,44 @@ impl Manager {
         crate::log!("agent {agent_id}: usage limit; continuing in {}", wait_text(delay));
         self.park_turn(agent_id, json!({ "type": "notification", "level": "warning", "message": message }));
         true
+    }
+
+    /// Background sub-agents reported back after the turn that launched them,
+    /// and the CLI runs a turn of its own on their results. Open one here so
+    /// the app shows the agent's reply (and notifies when it is done) instead
+    /// of dropping it. A turn already running simply takes the reports in.
+    fn open_background_turn(&mut self, agent_id: &str) {
+        let idle = self.agents.get(agent_id).map(|a| a.status != "running" && a.rec.archived_at.is_none()).unwrap_or(false);
+        // A late report from a process already shut down opens nothing.
+        if !idle || !self.claude.mark_busy(agent_id) {
+            return;
+        }
+        let turn_id = new_id();
+        let provider = {
+            let Some(a) = self.agents.get_mut(agent_id) else { return };
+            a.status = "running";
+            a.active_turn = Some((turn_id.clone(), now_iso()));
+            a.turn_text = SUBAGENT_REPORT_PROMPT.to_string();
+            a.attempts = 0;
+            // Retrying a quiet reply would restart the process mid-turn.
+            a.produced = true;
+            a.compacting = false;
+            a.retry_at = None;
+            a.limit_hit = None;
+            a.limit_wait = false;
+            a.limit_since = None;
+            a.last_event = Instant::now();
+            a.rec.last_error = None;
+            a.rec.attention_reason = None;
+            a.rec.provider.clone()
+        };
+        crate::log!("agent {agent_id}: background sub-agents reported back; the CLI continues on its own");
+        // Its process already holds a slot: account for the turn on it.
+        self.running.insert(agent_id.to_string());
+        self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
+        self.touch(agent_id);
+        self.publish_agent(agent_id);
+        self.persist_pending(agent_id);
     }
 
     /// The CLI ran a turn of its own while none was open here (background
@@ -1098,6 +1162,8 @@ impl Manager {
             .agents
             .values()
             .filter(|a| a.status == "running" && a.retry_at.is_none() && self.running.contains(&a.rec.id) && a.permissions.is_empty() && a.last_event.elapsed() >= limit)
+            // Waiting for a Claude slot (another chat's turn or background sub-agents) is not a stall.
+            .filter(|a| !self.claude.is_waiting(&a.rec.id))
             // A long-running tool call is quiet by nature.
             .filter(|a| !a.timeline.as_ref().and_then(|t| t.last()).map(|r| r.item.get("type").and_then(|t| t.as_str()) == Some("tool_call") && r.item.get("status").and_then(|s| s.as_str()) == Some("running")).unwrap_or(false))
             .map(|a| a.rec.id.clone())
@@ -1213,6 +1279,7 @@ impl Manager {
             }
             ProviderEvent::TurnCompleted { agent_id } => self.finish_turn(&agent_id, Ok(None)),
             ProviderEvent::TurnCanceled { agent_id, reason } => self.finish_turn(&agent_id, Ok(Some(reason))),
+            ProviderEvent::BackgroundTurn { agent_id } => self.open_background_turn(&agent_id),
             ProviderEvent::LimitHit { agent_id, resets_at } => {
                 let Some(a) = self.agents.get_mut(&agent_id) else { return };
                 if a.status == "running" {
@@ -1402,6 +1469,8 @@ const LIMIT_FIRST_POLL: Duration = Duration::from_secs(60);
 
 /// Sent when the usage limit has reset and a turn it stopped carries on.
 const LIMIT_PROMPT: &str = "The usage or rate limit that stopped you has reset. Continue from where you left off and finish the task.";
+/// Sent when the turn the CLI ran on background sub-agents' reports has to be retried.
+const SUBAGENT_REPORT_PROMPT: &str = "Your background sub-agents reported back while you were idle. Check their results and continue the task with them. If a sub-agent failed, say so and re-launch it if the work is still needed.";
 /// Sent when the limit that stopped sub-agents (yours or background ones) has reset.
 const SUBAGENT_LIMIT_PROMPT: &str = "Some of your sub-agents stopped early because of the usage or rate limit, which has now reset. Check what they left unfinished and finish it, re-launching them if needed. If nothing is left to do, say so briefly.";
 

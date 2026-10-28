@@ -155,7 +155,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_APP_BASE_URL` | `https://app.paseo.sh` | pairing link base |
 | `PASEO_CLAUDE_MAX_LIVE` | `auto` | max concurrent `claude` processes, or `auto` to follow the machine; extra prompts queue |
 | `PASEO_CLAUDE_KEEP_WARM` | `true` | keep the `claude` process warm and pre-start it |
-| `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off) |
+| `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off). A process with background sub-agents still working is kept until they report back (or go 30 minutes without activity); a prompt from another chat waits for it instead of evicting it |
 | `PASEO_CODEX_IDLE_SECS` | `300` | idle time before the shared app-server exits (when keep-warm is off) |
 | `PASEO_CODEX_MAX_ACTIVE` | `auto` | max concurrent Codex turns, or `auto`; extra prompts queue |
 | `PASEO_AGENT_MB` | `300` | `auto`: memory budgeted per agent, for the ceiling and the room check |
@@ -176,6 +176,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_DELETE_PROJECT_FILES` | `safe` | what removing a project does to its folder: `safe` deletes it only when nothing would be lost (see above); `all` deletes any project folder inside your home; `never` keeps everything |
 | `PASEO_TIMELINE_UNLOAD_SECS` | `600` | drop idle timelines from memory |
 | `PASEO_DEFAULT_SYSTEM_PROMPT` | built-in low-resource note | instructions added to every agent (Claude `--append-system-prompt`, Codex `developerInstructions`); the default tells agents not to run, serve or test the app locally on a small VM. Set to an empty string to disable |
+| `PASEO_CLAUDE_SUBAGENT_PROMPT` | built-in sub-agent note | instructions added to Claude Code agents only, after the ones above; the default tells them to run the independent parts of a task as parallel sub-agents (Agent tool, in the background). Sub-agents live inside the agent's own `claude` process, so they add parallelism on a machine that fits only one process. Set to an empty string to disable |
 
 A systemd unit is in `contrib/paseo-lite.service`.
 

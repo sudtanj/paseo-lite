@@ -8,6 +8,11 @@ use std::time::Duration;
 /// starting dev servers, test suites or builds can starve or OOM the host.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are running on a low-resource VM (for example a 1 GB RAM free-tier instance) that is shared with the agent daemon itself. Do not run, start, or serve the application you are developing locally (no dev servers, `npm run dev`/`start`, `cargo run`, `docker compose up`, emulators or browsers), and do not run its test suites, end-to-end tests, benchmarks or full builds locally - they can exhaust the machine's memory and CPU and take it down. Verify changes by careful code reading and reasoning instead, and rely on CI or the user to build and test. Lightweight commands such as git, file inspection, searching, formatting or a single quick syntax check are fine. If verification genuinely requires running something heavy, stop and ask the user first.";
 
+/// Added for Claude Code only (after the prompts above). Sub-agents run inside
+/// the agent's own `claude` process, so they are the cheap way to work in
+/// parallel on a machine that fits one process.
+pub const CLAUDE_SUBAGENT_PROMPT: &str = "This machine usually fits only one Claude Code process at a time, so other chats wait in a queue, but sub-agents run inside your own process and cost little extra memory. When a task splits into independent parts (separate files or modules, separate questions to research, a review alongside the implementation), run them in parallel as sub-agents with the Agent tool, in the background while you keep working, instead of doing them one after another. Give each one a narrow, self-contained brief that names the files to look at. Do small tasks yourself, keep it to a few sub-agents at once, and make sure they follow the same rules about not running heavy commands.";
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub home: PathBuf,
@@ -84,6 +89,9 @@ pub struct Config {
     /// Instructions added to every agent; `PASEO_DEFAULT_SYSTEM_PROMPT` overrides
     /// it, and setting it to an empty string disables it.
     pub default_system_prompt: Option<String>,
+    /// Added to Claude Code agents only: use sub-agents for parallel work.
+    /// `PASEO_CLAUDE_SUBAGENT_PROMPT` overrides it, an empty string disables it.
+    pub claude_subagent_prompt: Option<String>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -164,6 +172,11 @@ impl Config {
                 Ok(v) if v.trim().is_empty() => None,
                 Ok(v) => Some(v),
                 Err(_) => Some(DEFAULT_SYSTEM_PROMPT.to_string()),
+            },
+            claude_subagent_prompt: match std::env::var("PASEO_CLAUDE_SUBAGENT_PROMPT") {
+                Ok(v) if v.trim().is_empty() => None,
+                Ok(v) => Some(v),
+                Err(_) => Some(CLAUDE_SUBAGENT_PROMPT.to_string()),
             },
         }
     }
