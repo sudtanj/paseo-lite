@@ -25,6 +25,10 @@ so you can pair it with the Paseo apps exactly like the Node daemon.
 
 Idle cost is the daemon plus one warm process of the active CLI (`claude` or `codex app-server`). Set `PASEO_CODEX_KEEP_WARM=0` / `PASEO_CLAUDE_KEEP_WARM=0` to start them on demand and release them after `PASEO_CODEX_IDLE_SECS` / `PASEO_CLAUDE_IDLE_SECS` instead.
 
+<!-- bench:summary -->
+Measured numbers for simulated small machines appear here after the first [Benchmark](#benchmark) run on `main`.
+<!-- /bench:summary -->
+
 ## Relay and pairing
 
 The relay code is a byte-compatible port of `@getpaseo/relay`:
@@ -218,6 +222,46 @@ paseo-lite is built and maintained by one person in their spare time. If it save
 ```sh
 cargo test --bins          # unit tests (config, cleanup guards, push, snapshots, retries)
 cargo test --test e2e      # integration tests: real binary over HTTP/WebSocket with a fake claude CLI
+cargo test --release --test bench -- --ignored --nocapture   # benchmark on simulated small machines (needs Docker), see below
 ```
 
-CI runs both on every push and pull request, and the rolling `latest` release is only published when they pass.
+CI runs the unit and integration tests on every push and pull request, and the rolling `latest` release is only published when they pass.
+
+## Benchmark
+
+The Benchmark workflow (`.github/workflows/bench.yml`) runs `tests/bench.rs` on an amd64 and an arm64
+runner whenever code changes on `main` (or from the Actions tab), and rewrites the numbers below and in
+the summary near the top. Each simulated machine is a Docker container with that machine's memory
+(swap off) and CPU quota. paseo-lite reads its limits from the container's cgroup, so the auto capacity
+it picks is the one it would pick on that machine:
+
+| System | Runner | Memory | CPUs |
+|---|---|---:|---:|
+| GCP e2-micro (free tier), sustained baseline | amd64 | 1 GB | 0.25 |
+| 512 MB VPS | amd64 | 512 MB | 1 |
+| Small VPS | amd64 | 4 GB | 2 |
+| 1 GB single-board computer (Orange Pi Zero 3, Raspberry Pi 3) | arm64 | 1 GB | 4 |
+| OCI Ampere A1 (free tier, scaled to the runner) | arm64 | 12 GB | 4 |
+
+A fake `claude` CLI stands in for Claude Code. It holds 200 MiB like a real process does (`BENCH_CLAUDE_MB`),
+and answers each prompt with a turn of about 1 s: streamed text, a tool call and a final message. On each
+system the benchmark runs:
+
+- one chat for 10 turns: the first turn starts the CLI process, the rest reuse it;
+- 6 chats started at once, 3 turns each. These turns queue for the CLI slots the daemon allows on that
+  machine, and turn latency includes that wait.
+
+It records turn latency, the peak RSS of the daemon, the peak memory of the whole container (daemon plus
+`claude` processes), the most `claude` processes running at once, the capacity the daemon chose, and OOM
+kills. Auto capacity waits 10 s with work queued before adding a worker here (`PASEO_AUTO_STABLE_SECS`;
+the default is 60 s), so the runs show it growing. The benchmark fails on any failed turn or OOM kill, and
+the README is only updated when every system passes.
+
+```sh
+docker pull ubuntu:24.04
+BENCH_SYSTEMS=gcp-e2-micro,vps-512m cargo test --release --test bench -- --ignored --nocapture
+```
+
+<!-- bench:report -->
+No results yet: the first run on `main` fills this in.
+<!-- /bench:report -->

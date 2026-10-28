@@ -1,0 +1,94 @@
+name: Benchmark
+
+# The release daemon in Docker containers sized like the small machines it targets
+# (memory and CPU limits, no swap), on an amd64 and an arm64 runner; see tests/bench.rs
+# for what is measured. The tables land in the job summaries and, on main, in the README
+# (between the bench markers).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "web/**"
+      - "Cargo.toml"
+      - "tests/bench.rs"
+      - ".github/workflows/bench.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bench
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The image matches the runner's OS, so the glibc build runs in it as is.
+          - runner: ubuntu-24.04
+            arch: amd64
+            systems: gcp-e2-micro,vps-512m,vps-2c-4g
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            systems: sbc-1g,oci-a1
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bench-${{ matrix.arch }}
+      - run: docker pull -q ubuntu:24.04
+      - name: Benchmark
+        env:
+          BENCH_SYSTEMS: ${{ matrix.systems }}
+          BENCH_OUT: ${{ github.workspace }}/bench-${{ matrix.arch }}.md
+          BENCH_SUMMARY_OUT: ${{ github.workspace }}/bench-summary-${{ matrix.arch }}.md
+        run: cargo test --release --test bench -- --ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.arch }}
+          path: bench-*.md
+
+  readme:
+    needs: [bench]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: bench
+          merge-multiple: true
+      - name: Update README
+        run: |
+          set -euo pipefail
+          # Replace the lines between <!-- bench:NAME --> and <!-- /bench:NAME --> with FILE.
+          replace() {
+            awk -v name="$1" -v file="$2" '
+              $0 == "<!-- bench:" name " -->" { print; while ((getline line < file) > 0) print line; skip = 1; next }
+              $0 == "<!-- /bench:" name " -->" { skip = 0 }
+              !skip
+            ' README.md > README.tmp
+            mv README.tmp README.md
+          }
+          { cat bench/bench-amd64.md; printf '\n\n'; cat bench/bench-arm64.md; echo; } > report.md
+          replace summary bench/bench-summary-amd64.md
+          replace report report.md
+      - name: Commit README
+        run: |
+          git diff --quiet README.md && exit 0
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -q -m "docs: benchmark numbers for ${GITHUB_SHA::7}"
+          git pull -q --rebase origin main
+          git push origin HEAD:main
