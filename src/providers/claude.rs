@@ -9,7 +9,9 @@
 //! At most `max_live` children run at once across all projects: the fixed
 //! `claude_max_live`, or the manager's auto capacity (one on a small machine).
 //! When the cap is hit the oldest idle child is evicted, or the prompt waits
-//! in a FIFO queue until a running turn finishes.
+//! in a FIFO queue until a running turn finishes. A child whose turn is over
+//! and only background sub-agents work in it takes no slot, so another chat
+//! can start alongside it (unless the machine is strained).
 //! With `claude_keep_warm` the idle child is never reaped, and the manager
 //! pre-starts one (`prewarm`) so the next prompt skips the cold start.
 
@@ -63,17 +65,21 @@ pub struct ClaudePool {
     /// Sub-agents each process may run at once, shared with every stream
     /// reader's gate (0 while the machine is strained).
     sub_cap: Arc<AtomicUsize>,
+    /// The machine is under pressure: children holding sub-agents count
+    /// against the cap again.
+    strained: bool,
 }
 
 impl ClaudePool {
     pub fn new(cfg: Config, events: EventTx) -> Self {
         let sub_cap = Arc::new(AtomicUsize::new(cfg.claude_max_subagents));
-        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap }
+        ClaudePool { cfg, events, procs: HashMap::new(), waiting: VecDeque::new(), generation: 0, max_live: 1, sub_cap, strained: false }
     }
 
     /// How many sub-agents a process may start now: the configured cap, or
     /// none while the machine is strained (running ones carry on).
-    pub fn set_strained(&self, strained: bool) {
+    pub fn set_strained(&mut self, strained: bool) {
+        self.strained = strained;
         let cap = if strained { 0 } else { self.cfg.claude_max_subagents };
         if self.sub_cap.swap(cap, Ordering::Relaxed) != cap {
             crate::log!("claude: up to {cap} sub-agent(s) per agent");
@@ -88,12 +94,22 @@ impl ClaudePool {
         self.max_live
     }
 
+    /// Children that take a slot. One between turns whose background
+    /// sub-agents are still working doesn't block other chats, unless the
+    /// machine is strained.
+    fn occupied(&self) -> usize {
+        if self.strained {
+            return self.procs.len();
+        }
+        self.procs.values().filter(|p| p.busy || !p.holding()).count()
+    }
+
     /// Change the process cap. Lowering it stops warm idle processes above
     /// the new cap (busy ones finish their turn first); raising it returns
     /// waiting prompts that may start now.
     pub fn set_max_live(&mut self, max: usize) -> Vec<(AgentSpec, String)> {
         self.max_live = max.max(1);
-        while self.procs.len() > self.max_live && self.evict_one_idle() {}
+        while self.occupied() > self.max_live && self.evict_one_idle() {}
         self.drain_waiting()
     }
 
@@ -149,7 +165,7 @@ impl ClaudePool {
             }
             self.procs.remove(&spec.id);
         }
-        if self.procs.len() >= self.max_live && !self.evict_one_idle() {
+        if self.occupied() >= self.max_live && !self.evict_one_idle() {
             self.waiting.push_back((spec, text));
             return SendOutcome::Queued;
         }
@@ -328,7 +344,7 @@ impl ClaudePool {
     }
 
     fn drain_waiting(&mut self) -> Vec<(AgentSpec, String)> {
-        let mut free = self.max_live.saturating_sub(self.procs.len());
+        let mut free = self.max_live.saturating_sub(self.occupied());
         // Make room for one waiting prompt by evicting a warm-but-idle process.
         if free == 0 && !self.waiting.is_empty() && self.evict_one_idle() {
             free = 1;

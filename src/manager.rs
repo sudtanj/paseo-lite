@@ -640,7 +640,7 @@ impl Manager {
                 match self.claude.send(spec, text) {
                     SendOutcome::Failed(error) => self.finish_turn(&id, Err(error)),
                     SendOutcome::Queued => {
-                        let note = json!({ "type": "notification", "level": "info", "message": "Queued: waiting for another chat's Claude Code to finish (a turn or background sub-agents)" });
+                        let note = json!({ "type": "notification", "level": "info", "message": "Queued: waiting for another chat's Claude Code to finish (a turn, or background sub-agents while the machine is under load)" });
                         self.append_item(&id, note);
                     }
                     SendOutcome::Started => {}

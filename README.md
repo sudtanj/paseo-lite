@@ -159,7 +159,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_APP_BASE_URL` | `https://app.paseo.sh` | pairing link base |
 | `PASEO_CLAUDE_MAX_LIVE` | `auto` | max concurrent `claude` processes, or `auto` to follow the machine; extra prompts queue |
 | `PASEO_CLAUDE_KEEP_WARM` | `true` | keep the `claude` process warm and pre-start it |
-| `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off). A process with background sub-agents still working is kept until they report back (or go 30 minutes without activity); a prompt from another chat waits for it instead of evicting it |
+| `PASEO_CLAUDE_IDLE_SECS` | `90` | keep-warm time after a Claude turn (when keep-warm is off). A process with background sub-agents still working is kept until they report back (or go 30 minutes without activity); it is not evicted, but it takes no slot, so a prompt from another chat starts alongside it (while the machine is strained the prompt waits for it instead) |
 | `PASEO_CODEX_IDLE_SECS` | `300` | idle time before the shared app-server exits (when keep-warm is off) |
 | `PASEO_CODEX_MAX_ACTIVE` | `auto` | max concurrent Codex turns, or `auto`; extra prompts queue |
 | `PASEO_AGENT_MB` | `300` | `auto`: memory budgeted per agent, for the ceiling and the room check |
