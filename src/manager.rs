@@ -1182,6 +1182,14 @@ impl Manager {
         self.persist_pending(agent_id);
         let Some(agent) = self.agents.get_mut(agent_id) else { return };
         if agent.status != "running" {
+            // Only background sub-agents left: Stop ends them and frees the slot.
+            if agent.rec.provider == "claude" {
+                if let Some(ready) = self.claude.stop_sub_agents(agent_id) {
+                    self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": "Stopped the background sub-agents" }));
+                    self.send_ready(ready);
+                    self.publish_agent(agent_id);
+                }
+            }
             return;
         }
         if agent.retry_at.take().is_some() {
@@ -1198,6 +1206,10 @@ impl Manager {
             let codex = self.codex.clone();
             let id = agent_id.to_string();
             tokio::spawn(async move { codex.interrupt(&id).await });
+        } else if let Some(ready) = self.claude.stop_sub_agents(agent_id) {
+            // An interrupt would end the turn but leave background sub-agents running.
+            self.send_ready(ready);
+            self.finish_turn(agent_id, Ok(Some("canceled".into())));
         } else if self.claude.interrupt(agent_id) {
             self.finish_turn(agent_id, Ok(Some("canceled before start".into())));
         }

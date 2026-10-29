@@ -395,6 +395,18 @@ impl ClaudePool {
         }
     }
 
+    /// Stop the agent's process when background sub-agents work in it (an
+    /// interrupt would leave them running). Returns waiting prompts that may
+    /// start in the freed slot, or None when there was nothing to stop.
+    pub fn stop_sub_agents(&mut self, agent_id: &str) -> Option<Vec<(AgentSpec, String)>> {
+        if !self.procs.get(agent_id)?.holding() {
+            return None;
+        }
+        crate::log!("claude: stopping agent {agent_id} and its background sub-agents");
+        self.stop(agent_id);
+        Some(self.drain_waiting())
+    }
+
     pub fn stop(&mut self, agent_id: &str) {
         self.waiting.retain(|(s, _)| s.id != agent_id);
         if let Some(mut p) = self.procs.remove(agent_id) {
