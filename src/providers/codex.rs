@@ -119,7 +119,7 @@ impl Codex {
 
     fn spawn(&self) -> Result<(), String> {
         let mut cmd = Command::new(&self.inner.cfg.codex_bin);
-        cmd.arg("app-server").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        cmd.arg("app-server").args(crate::mcp::codex_args(&self.inner.cfg)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         super::deprioritize(&mut cmd, &self.inner.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.inner.cfg.codex_bin))?;
         let mut stdin = child.stdin.take().ok_or("no stdin")?;

@@ -96,6 +96,9 @@ pub struct Config {
     /// Sub-agents one Claude Code agent may run at once (foreground or
     /// background); further launches are refused until one reports back.
     pub claude_max_subagents: usize,
+    /// zilong-router MCP gateway (`http://<router>:20128/mcp`) given to both CLIs (see mcp.rs).
+    pub zilong_mcp_url: Option<String>,
+    pub zilong_api_key: Option<String>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -183,6 +186,8 @@ impl Config {
                 Err(_) => Some(CLAUDE_SUBAGENT_PROMPT.to_string()),
             },
             claude_max_subagents: env("PASEO_CLAUDE_MAX_SUBAGENTS").and_then(|v| v.parse().ok()).unwrap_or(3),
+            zilong_mcp_url: env("PASEO_ZILONG_MCP_URL"),
+            zilong_api_key: env(crate::mcp::KEY_ENV),
         }
     }
 }

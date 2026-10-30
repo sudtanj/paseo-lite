@@ -205,6 +205,11 @@ impl ClaudePool {
         let generation = self.generation;
         let mut cmd = Command::new(&self.cfg.claude_bin);
         cmd.args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--permission-prompt-tool", "stdio"]);
+        // Added to the user's own servers (no --strict-mcp-config). The option
+        // is variadic, so it must be followed by another flag.
+        if let Some(mcp) = crate::mcp::claude_config(&self.cfg) {
+            cmd.arg("--mcp-config").arg(mcp);
+        }
         cmd.args(["--permission-mode", spec.mode_id.as_deref().unwrap_or("default")]);
         if let Some(model) = spec.model.as_deref().filter(|m| !m.is_empty() && *m != "default") {
             cmd.args(["--model", model]);

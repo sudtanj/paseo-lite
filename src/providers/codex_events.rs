@@ -154,6 +154,9 @@ impl Codex {
     }
 
     pub(super) fn handle_server_request(&self, id: Value, method: &str, params: Value) {
+        if method == "mcpServer/elicitation/request" {
+            return self.handle_elicitation(id, params);
+        }
         let is_approval = matches!(
             method,
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" | "execCommandApproval" | "applyPatchApproval"
@@ -202,6 +205,51 @@ impl Codex {
                 (false, false, false) => "decline",
             };
             this.send_raw(json!({ "id": id, "result": { "decision": decision } }));
+            let mut st = this.inner.state.lock().unwrap();
+            st.open_approvals = st.open_approvals.saturating_sub(1);
+        });
+    }
+
+    /// An MCP server (or Codex, to approve an MCP tool call) asks the user
+    /// something. One with no fields to fill in is shown as a permission
+    /// prompt; forms and URLs, which the app can't show, are declined so the
+    /// turn never stalls.
+    fn handle_elicitation(&self, id: Value, params: Value) {
+        let request = params.get("request").unwrap_or(&params);
+        let server = s(&params, "serverName").unwrap_or_else(|| "mcp".into());
+        let message = s(request, "message").unwrap_or_default();
+        let fields = request.pointer("/requestedSchema/properties").and_then(|p| p.as_object()).map(|p| !p.is_empty()).unwrap_or(false);
+        let url = s(request, "mode").as_deref() == Some("url");
+        let agent_id = self.agent_for(&params);
+        let (false, false, Some(agent_id)) = (fields, url, agent_id) else {
+            crate::log!("codex: declined an MCP request from {server:?} the app can't show: {}", crate::util::truncate(&message, 200));
+            self.send_raw(json!({ "id": id, "result": { "action": "decline", "content": null } }));
+            return;
+        };
+        let request = json!({
+            "id": format!("perm-{}", crate::util::new_id()),
+            "provider": "codex",
+            "name": format!("mcp__{server}"),
+            "kind": "tool",
+            "title": format!("MCP: {server}"),
+            "description": message,
+            "input": params,
+            "detail": { "type": "plain_text", "label": format!("MCP server {server}"), "text": message },
+        });
+        let (tx, rx) = oneshot::channel::<Value>();
+        self.inner.state.lock().unwrap().open_approvals += 1;
+        self.emit(ProviderEvent::Permission { agent_id, request, reply: tx });
+        let this = self.clone();
+        tokio::spawn(async move {
+            let answer = rx.await.unwrap_or_else(|_| json!({ "behavior": "deny", "interrupt": true }));
+            let allow = answer.get("behavior").and_then(|b| b.as_str()) == Some("allow");
+            let interrupt = answer.get("interrupt").and_then(|i| i.as_bool()).unwrap_or(false);
+            let result = match (allow, interrupt) {
+                (true, _) => json!({ "action": "accept", "content": {} }),
+                (false, true) => json!({ "action": "cancel", "content": null }),
+                (false, false) => json!({ "action": "decline", "content": null }),
+            };
+            this.send_raw(json!({ "id": id, "result": result }));
             let mut st = this.inner.state.lock().unwrap();
             st.open_approvals = st.open_approvals.saturating_sub(1);
         });

@@ -8,6 +8,7 @@ mod egress;
 mod files;
 mod git_actions;
 mod manager;
+mod mcp;
 mod projects;
 mod push;
 mod providers;
@@ -112,6 +113,7 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
     });
 
     crate::log!("paseo-lite {} serverId={} home={}", env!("CARGO_PKG_VERSION"), identity.server_id, cfg.home.display());
+    mcp::write_claude_config(&cfg);
     uploads::prune(&cfg.home);
     usage::load_prices(&cfg.home);
     tokio::spawn(usage::refresh_prices(cfg.home.clone()));
