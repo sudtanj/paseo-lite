@@ -672,7 +672,7 @@ impl Manager {
     fn update_capacity(&mut self) {
         let queued = self.cli_queue.len() + self.claude.waiting_count();
         let running = self.running.len();
-        let change = self.capacity.update(running, queued);
+        let change = self.capacity.update(running, queued, self.claude.idle_mb());
         if change == crate::capacity::Change::Critical {
             let freed = self.claude.release_idle();
             if freed > 0 {
@@ -687,6 +687,13 @@ impl Manager {
             self.send_ready(ready);
         }
         if change == crate::capacity::Change::Grew {
+            // Growth may have counted warm idle memory as room: free it now,
+            // before the extra turn starts, instead of letting the kernel
+            // swap or the next spawn find the container full.
+            if self.capacity.room_short() {
+                let keep: Vec<&str> = self.cli_queue.iter().map(|(id, _)| id.as_str()).collect();
+                self.claude.release_one_idle(&keep);
+            }
             self.pump();
         }
     }

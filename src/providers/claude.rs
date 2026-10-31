@@ -54,10 +54,43 @@ impl Proc {
     }
 
     /// Idle between turns, but its background sub-agents are still working:
-    /// stopping it would kill them.
+    /// stopping it would kill them. Background shells that went quiet are
+    /// checked against the process tree: with no child process left they
+    /// are over (their report was lost), and the process stops holding
+    /// memory the pool can't account for.
     fn holding(&self) -> bool {
-        self.sub_active.lock().unwrap().holding()
+        let sub = self.sub_active.lock().unwrap();
+        if !sub.holding() {
+            return false;
+        }
+        let over = sub.running && sub.shells_only && sub.quiet() >= SHELLS_CHECK_AFTER && self.pid.map(|pid| has_children(pid) == Some(false)).unwrap_or(false);
+        !over
     }
+
+    /// Resident memory in MB, for the capacity's room check.
+    fn rss_mb(&self) -> u64 {
+        let status = self.pid.and_then(|pid| std::fs::read_to_string(format!("/proc/{pid}/status")).ok()).unwrap_or_default();
+        let kb = status.lines().find_map(|l| l.strip_prefix("VmRSS:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok()).unwrap_or(0);
+        kb / 1024
+    }
+}
+
+/// Quiet background shells are checked for leftover processes after this.
+const SHELLS_CHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Whether a process has child processes, from `/proc/<pid>/task/*/children`.
+/// None when that can't be read (the caller then assumes it has).
+fn has_children(pid: u32) -> Option<bool> {
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut read_any = false;
+    for task in tasks.flatten() {
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else { continue };
+        read_any = true;
+        if !children.trim().is_empty() {
+            return Some(true);
+        }
+    }
+    read_any.then_some(false)
 }
 
 pub enum SendOutcome {
@@ -103,6 +136,12 @@ impl ClaudePool {
 
     pub fn max_live(&self) -> usize {
         self.max_live
+    }
+
+    /// Memory held by warm idle children, which the pool stops whenever a
+    /// prompt needs their slot.
+    pub fn idle_mb(&self) -> u64 {
+        self.procs.values().filter(|p| !p.busy() && !p.holding()).map(Proc::rss_mb).sum()
     }
 
     /// Children that take a slot. One between turns whose background
@@ -203,6 +242,21 @@ impl ClaudePool {
             self.stop(id);
         }
         idle.len()
+    }
+
+    /// Stop the longest-idle warm process, except those of `keep` (agents
+    /// about to run, which would otherwise cold-start). For the capacity:
+    /// growing counted warm idle memory as room, and this makes it real.
+    pub fn release_one_idle(&mut self, keep: &[&str]) -> bool {
+        let victim = self.procs.iter().filter(|(id, p)| !p.busy() && !p.holding() && !keep.contains(&id.as_str())).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
+        match victim {
+            Some(id) => {
+                crate::log!("claude: releasing idle process of agent {id} to make room for one more agent");
+                self.stop(&id);
+                true
+            }
+            None => false,
+        }
     }
 
     fn evict_one_idle(&mut self) -> bool {
@@ -470,13 +524,14 @@ impl ClaudePool {
             .procs
             .iter()
             .map(|(id, p)| {
+                let holding = p.holding();
                 let sub = p.sub_active.lock().unwrap();
                 json!({
                     "agentId": id,
                     "pid": p.pid,
                     "generation": p.generation,
                     "busy": p.busy(),
-                    "holding": sub.holding(),
+                    "holding": holding,
                     "subAgentsRunning": sub.running,
                     "subAgentsQuietSecs": sub.last_seen.map(|t| t.elapsed().as_secs()),
                     "interrupted": p.interrupted.load(Ordering::SeqCst),

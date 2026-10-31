@@ -4,7 +4,8 @@
 //! the ceiling, so a fresh daemon uses the whole machine at once, shrinks by
 //! one when pressure builds up, and grows back by one while turns are queued
 //! and the machine has stayed calm for `stable` (low memory/CPU pressure, no
-//! CPU throttling, room for another agent). It never exceeds the
+//! CPU throttling, room for another agent, warm idle processes counting as
+//! room). It never exceeds the
 //! ceiling: what the memory limit fits at `agent_mb` per agent, the CPU count
 //! times two, what the pids limit fits, and `max`. Running turns are never
 //! stopped; a lower limit only holds back the next ones, which wait in the
@@ -105,6 +106,9 @@ pub struct Sample {
     pub pids: Option<u64>,
     /// Share of the last interval the CPU quota throttled the container.
     pub throttle: Option<f64>,
+    /// Memory held by warm idle agent processes, which the pool stops as soon
+    /// as a new turn needs the room: free for the purpose of growing.
+    pub reclaim_mb: u64,
 }
 
 pub struct Capacity {
@@ -148,13 +152,20 @@ impl Capacity {
         self.limit
     }
 
+    /// The last reading had less free memory than one agent needs: the room
+    /// for it is held by warm idle processes.
+    pub fn room_short(&self) -> bool {
+        self.last.avail_mb.map(|a| a < self.agent_mb).unwrap_or(false)
+    }
+
     /// The last reading showed pressure: don't start optional work (warm-ups).
     pub fn strained(&self) -> bool {
         self.strained
     }
 
-    /// Read the machine and adjust the limit.
-    pub fn update(&mut self, running: usize, queued: usize) -> Change {
+    /// Read the machine and adjust the limit. `reclaim_mb`: memory held by
+    /// warm idle processes the pool would stop to make room.
+    pub fn update(&mut self, running: usize, queued: usize, reclaim_mb: u64) -> Change {
         let now = Instant::now();
         let mut change = Change::None;
         if now.duration_since(self.limits_at) >= LIMITS_REFRESH {
@@ -163,6 +174,7 @@ impl Capacity {
         }
         let mut sample = read_sample(self.limits.mem_mb);
         sample.throttle = self.throttle_share(now);
+        sample.reclaim_mb = reclaim_mb;
         match self.apply(sample, running, queued, now) {
             Change::None => change,
             other => other,
@@ -229,8 +241,10 @@ impl Capacity {
             }
             return if self.critical { Change::Critical } else if shrank { Change::Shrank } else { Change::None };
         }
-        // Without a memory reading the room check can't pass: stay put.
-        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a >= self.agent_mb).unwrap_or(false);
+        // Without a memory reading the room check can't pass: stay put. Warm
+        // idle processes count as room: the next turn stops one if it must,
+        // and otherwise they would hold the limit down for good.
+        let calm = under(s.mem_pressure, MEM_PRESSURE_CALM) && under(s.cpu_pressure, CPU_PRESSURE_CALM) && under(s.throttle, THROTTLE_CALM) && !pids_below(PIDS_PER_AGENT) && s.avail_mb.map(|a| a + s.reclaim_mb >= self.agent_mb).unwrap_or(false);
         if !calm {
             self.calm_since = None;
             return Change::None;
@@ -285,6 +299,7 @@ impl Capacity {
             "cpus": self.limits.cpus,
             "pidsMax": self.limits.pids_max,
             "availMb": self.last.avail_mb,
+            "reclaimMb": self.last.reclaim_mb,
             "memPressure": self.last.mem_pressure,
             "cpuPressure": self.last.cpu_pressure,
             "pids": self.last.pids,
@@ -298,8 +313,9 @@ impl Capacity {
 fn describe(s: &Sample) -> String {
     let pct = |v: Option<f64>| v.map(|v| format!("{v:.1}%")).unwrap_or_else(|| "n/a".into());
     format!(
-        "free {}, memory pressure {}, CPU pressure {}, CPU throttled {}, pids {}",
+        "free {}{}, memory pressure {}, CPU pressure {}, CPU throttled {}, pids {}",
         s.avail_mb.map(|a| format!("{a} MB")).unwrap_or_else(|| "n/a".into()),
+        if s.reclaim_mb > 0 { format!(" (+{} MB in warm idle processes)", s.reclaim_mb) } else { String::new() },
         pct(s.mem_pressure),
         pct(s.cpu_pressure),
         pct(s.throttle.map(|t| t * 100.0)),
@@ -456,6 +472,7 @@ fn read_sample(limit_mb: Option<u64>) -> Sample {
         cpu_pressure: pressure("cpu"),
         pids: read_num("/sys/fs/cgroup/pids.current").or_else(|| read_num("/sys/fs/cgroup/pids/pids.current")),
         throttle: None,
+        reclaim_mb: 0,
     }
 }
 
@@ -473,7 +490,7 @@ mod tests {
     }
 
     fn calm() -> Sample {
-        Sample { avail_mb: Some(2000), mem_pressure: Some(0.0), cpu_pressure: Some(5.0), pids: None, throttle: Some(0.0) }
+        Sample { avail_mb: Some(2000), mem_pressure: Some(0.0), cpu_pressure: Some(5.0), pids: None, throttle: Some(0.0), reclaim_mb: 0 }
     }
 
     #[test]
@@ -638,6 +655,16 @@ mod tests {
         let unknown = Sample { avail_mb: None, ..calm() };
         c.apply(unknown, 1, 2, t0);
         assert_eq!(c.apply(unknown, 1, 2, t0 + Duration::from_secs(60)), Change::None);
+    }
+
+    #[test]
+    fn warm_idle_processes_count_as_room() {
+        let mut c = cap(4);
+        let t0 = Instant::now();
+        // 200 MB free plus a 150 MB warm idle process fits a 300 MB agent.
+        let warm = Sample { avail_mb: Some(200), reclaim_mb: 150, ..calm() };
+        c.apply(warm, 1, 2, t0);
+        assert_eq!(c.apply(warm, 1, 2, t0 + Duration::from_secs(30)), Change::Grew);
     }
 
     #[test]

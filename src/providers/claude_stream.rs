@@ -76,9 +76,17 @@ pub struct SubAgents {
     pub last_seen: Option<Instant>,
     /// Silence after which running work is taken for hung.
     pub quiet_max: Duration,
+    /// All of it is background shells, which run as child processes of the
+    /// CLI: once it has none left they are over, whatever was reported.
+    pub shells_only: bool,
 }
 
 impl SubAgents {
+    /// Silent this long.
+    pub fn quiet(&self) -> Duration {
+        self.last_seen.map(|t| t.elapsed()).unwrap_or(Duration::MAX)
+    }
+
     /// Whether the process must stay up for them.
     pub fn holding(&self) -> bool {
         let quiet = self.last_seen.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
@@ -281,7 +289,8 @@ impl StreamState {
     /// longer than sub-agents before they count as hung.
     fn note_background(&self) {
         let quiet_max = if self.background.values().all(|(name, _)| is_agent_tool(name)) { SUBAGENT_QUIET_MAX } else { BACKGROUND_QUIET_MAX };
-        *self.sub_active.lock().unwrap() = SubAgents { running: !self.background.is_empty(), last_seen: Some(Instant::now()), quiet_max };
+        let shells_only = !self.background.is_empty() && self.background.values().all(|(name, _)| name == "Bash");
+        *self.sub_active.lock().unwrap() = SubAgents { running: !self.background.is_empty(), last_seen: Some(Instant::now()), quiet_max, shells_only };
     }
 
     /// A Task card whose log is the sub-agent's actions so far.
