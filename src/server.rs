@@ -21,7 +21,7 @@ struct AppState {
 pub async fn serve(ctx: Arc<Ctx>, listen: String, hostnames: Vec<String>) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
     let state = AppState { ctx, hostnames: Arc::new(hostnames) };
-    let app = Router::new().route("/", get(index)).route("/ws", get(ws_upgrade)).with_state(state);
+    let app = Router::new().route("/", get(index)).route("/ws", get(ws_upgrade)).route("/api/files/download", get(download)).with_state(state);
     crate::log!("listening on http://{listen} (web UI) and ws://{listen}/ws");
     // Nagle off: agent stream updates are many small frames.
     axum::serve(listener, app).tcp_nodelay(true).await
@@ -38,6 +38,51 @@ async fn index() -> Response {
         (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
     ];
     (headers, Html(INDEX_HTML)).into_response()
+}
+
+fn json_error(status: StatusCode, error: &str) -> Response {
+    (status, [(header::CONTENT_TYPE, "application/json")], serde_json::json!({ "error": error }).to_string()).into_response()
+}
+
+/// `GET /api/files/download?token=…`: streams a file for a single-use token
+/// from `file_download_token_request` (files.rs), like upstream's route.
+/// Only reachable on a direct connection; over the relay the app reads the
+/// file through `file_explorer_request` instead.
+async fn download(State(state): State<AppState>, headers: HeaderMap, uri: axum::http::Uri) -> Response {
+    use tokio::io::AsyncReadExt;
+    if !host_allowed(&headers, &state.hostnames) {
+        return (StatusCode::FORBIDDEN, "Host not allowed").into_response();
+    }
+    let token = uri.query().unwrap_or("").split('&').find_map(|kv| kv.strip_prefix("token=")).map(str::trim).filter(|t| !t.is_empty());
+    let Some(token) = token else { return json_error(StatusCode::BAD_REQUEST, "Missing download token") };
+    let Some(entry) = crate::files::take_download(token) else { return json_error(StatusCode::FORBIDDEN, "Invalid or expired token") };
+    let opened = tokio::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW).open(&entry.path).await;
+    let Ok(file) = opened else { return json_error(StatusCode::NOT_FOUND, "File not found") };
+    let size = match file.metadata().await {
+        Ok(meta) if meta.is_file() => meta.len(),
+        _ => return json_error(StatusCode::NOT_FOUND, "File not found"),
+    };
+    // 64 KiB at a time; never the whole file in memory.
+    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+        let mut file = file?;
+        let mut buf = vec![0u8; 64 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(buf), Some(file)))
+            }
+            Err(e) => Some((Err(e), None)),
+        }
+    });
+    axum::http::Response::builder()
+        .header(header::CONTENT_TYPE, entry.mime_type.as_str())
+        .header(header::CONTENT_DISPOSITION, crate::files::content_disposition(&entry.file_name))
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
+        .body(axum::body::Body::from_stream(chunks))
+        .unwrap_or_else(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read file"))
 }
 
 /// DNS-rebinding guard, same policy as the Node daemon: IP literals and

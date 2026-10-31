@@ -383,9 +383,6 @@ impl Manager {
                 let entries: Vec<Value> = dirs.iter().map(|d| json!({ "path": d, "kind": "directory" })).collect();
                 reply(out, json!({ "type": "directory_suggestions_response", "payload": { "directories": dirs, "entries": entries, "error": null, "requestId": rid } }));
             }
-            "file_explorer_request" => {
-                reply(out, json!({ "type": "file_explorer_response", "payload": crate::files::explore(&msg, &rid) }));
-            }
             "checkout_status_request" => {
                 let (out, rid, cwd) = (out.clone(), rid.clone(), s(&msg, "cwd").unwrap_or_default());
                 tokio::spawn(async move {
@@ -443,7 +440,8 @@ impl Manager {
             }
             _ => {
                 let git = crate::git_actions::GitCtx { watcher: self.checkout.clone(), bcast: self.bcast.clone() };
-                if !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
+                // File explorer, downloads, saves and entry edits (files.rs).
+                if !crate::files::handle(&kind, &msg, &rid, out) && !crate::git_actions::handle(&git, &kind, &msg, &rid, out) && !self.handle_ext_rpc(&kind, &msg, &rid, out) && request_id.is_some() {
                     rpc_error(out, &rid, &kind, "not supported by paseo-lite");
                 }
             }

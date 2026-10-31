@@ -101,8 +101,16 @@ paseo-lite speaks Paseo's core WebSocket protocol subset with the upstream messa
   `project.rename`, `project.remove` / `archive_workspace` (archive the agents and clean up the folder, see below), `workspace.title.set`,
   `workspace.clear_attention`.
 - git actions for the Changes panel (no agent turn needed): commit (with an auto-written message when empty), push, pull, switch/rename/validate branch, branch suggestions, discard changes, refresh (fetch), commit history with per-file stats and diffs, stash save/pop/list, merge into base / merge from base, and pull request status/create/merge through the `gh` CLI.
+- file explorer and file pane: `file_explorer_request` (list a folder newest first, read a file: text up to 1 MiB
+  inline, images up to 2 MiB as base64, other binaries as metadata only), `file_download_token_request` with
+  `GET /api/files/download?token=…` on the direct listener (single-use, 60 s; over the relay the app reads the
+  file instead), `fs.file.write.request` (saves a text file of up to 1 MiB atomically, with a conflict check against
+  the version the app loaded), and `fs.entry.create` / `fs.entry.rename` (`git mv` for tracked files) /
+  `fs.entry.delete`. Every path must stay inside the request's `cwd`, including through symlinks.
+  Live file updates (`fs.file.subscribe`) and `fs.entry.duplicate` are not supported; the file pane then
+  reloads the file when you open it instead of updating live.
 
-Anything else (file editing, terminals, plugins, voice, schedules, Hub, worktrees) answers with
+Anything else (live file updates, duplicating files, terminals, plugins, voice, schedules, Hub, worktrees) answers with
 `rpc_error` / `unsupported`. The official app is expected to handle the core agent flow. Screens built
 on unsupported features will show errors.
 
