@@ -4,13 +4,12 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::SystemTime;
 
-/// Info-level log line (suppressed by `PASEO_LOG_CONSOLE_LEVEL=warn|error`).
+/// Info-level log line. Printed unless `PASEO_LOG_CONSOLE_LEVEL=warn|error`;
+/// always kept for the `daemon_logs` MCP tool.
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {
-        if $crate::util::log_enabled(2) {
-            $crate::util::emit_log("", format!($($arg)*))
-        }
+        $crate::util::emit_log("", $crate::util::log_enabled(2), format!($($arg)*))
     };
 }
 
@@ -18,9 +17,7 @@ macro_rules! log {
 #[macro_export]
 macro_rules! warn {
     ($($arg:tt)*) => {
-        if $crate::util::log_enabled(3) {
-            $crate::util::emit_log("WARN ", format!($($arg)*))
-        }
+        $crate::util::emit_log("WARN ", $crate::util::log_enabled(3), format!($($arg)*))
     };
 }
 
@@ -30,10 +27,12 @@ const LOG_KEEP: usize = 2000;
 const LOG_LINE_MAX: usize = 512;
 static LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 
-/// Print a log line to stderr and remember it in the ring buffer.
-pub fn emit_log(level: &str, msg: String) {
+/// Print a log line to stderr (when `print`) and remember it in the ring buffer.
+pub fn emit_log(level: &str, print: bool, msg: String) {
     let line = format!("[{}] {level}{msg}", now_iso());
-    eprintln!("{line}");
+    if print {
+        eprintln!("{line}");
+    }
     let line = if line.len() > LOG_LINE_MAX { truncate(&line, LOG_LINE_MAX) } else { line };
     if let Ok(mut ring) = LOG_RING.lock() {
         if ring.len() >= LOG_KEEP {
@@ -144,8 +143,8 @@ mod tests {
     #[test]
     fn recent_logs_are_kept_and_filtered() {
         let marker = format!("ring-test-{}", new_id());
-        emit_log("", format!("{marker} first"));
-        emit_log("WARN ", format!("{marker} second {}", "x".repeat(2000)));
+        emit_log("", false, format!("{marker} first"));
+        emit_log("WARN ", true, format!("{marker} second {}", "x".repeat(2000)));
         let lines = recent_logs(10, Some(&marker.to_ascii_uppercase()));
         assert_eq!(lines.len(), 2);
         assert!(lines[0].ends_with("first"));

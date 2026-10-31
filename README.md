@@ -233,10 +233,10 @@ a random token made at each daemon start, and must come from this machine. Claud
 | Tool | What it returns |
 |---|---|
 | `daemon_status` | version, pid, uptime, config with secrets redacted, turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure, load average |
-| `list_agents` | every agent: provider, title, cwd, status, CLI slot or queue position, queued messages, retry/limit state, last activity and error, pending permissions |
+| `list_agents` | `{limit=20, includeArchived=false}`: the most recently updated agents: provider, title, cwd, status, CLI slot or queue position, queued messages, retry/limit state, last activity and error, pending permissions |
 | `agent_timeline` | `{agentId, limit=50}`: the agent's latest timeline rows, long text cut to ~2000 characters |
 | `agent_processes` | live `claude` processes (agent, pid, busy, holding sub-agents, idle time, RSS/swap and descendants from `/proc`), prompts waiting for a slot, the shared `codex app-server` |
-| `daemon_logs` | `{lines=200, filter?}`: recent log lines (the last 2000 are kept in memory) |
+| `daemon_logs` | `{lines=200, filter?}`: recent log lines (the last 2000, at every level, are kept in memory even when `PASEO_LOG_CONSOLE_LEVEL` hides them) |
 | `list_projects` | projects and workspaces with agent counts |
 | `rpc` | `{message}`: one app-protocol session message through the same handler the app uses, returning its replies. Can change state |
 

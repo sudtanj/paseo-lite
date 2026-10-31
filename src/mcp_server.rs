@@ -144,7 +144,7 @@ fn tool(name: &str, description: &str, properties: Value, required: &[&str], rea
 fn tools() -> Vec<Value> {
     vec![
         tool("daemon_status", "paseo-lite daemon status: version, pid, uptime, config (secrets redacted), turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure (PSI), load average, daemon RSS.", json!({}), &[], true),
-        tool("list_agents", "All agents the daemon knows (most recently updated first): id, provider, title, cwd, status, active turn, whether it holds a CLI slot or waits in the queue, queued follow-up messages, retry/usage-limit state, last activity and error, pending permission requests.", json!({ "includeArchived": { "type": "boolean", "description": "Include archived agents (default false)." } }), &[], true),
+        tool("list_agents", "All agents the daemon knows (most recently updated first): id, provider, title, cwd, status, active turn, whether it holds a CLI slot or waits in the queue, queued follow-up messages, retry/usage-limit state, last activity and error, pending permission requests.", json!({ "includeArchived": { "type": "boolean", "description": "Include archived agents (default false)." }, "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Most recently updated agents to return (default 20)." } }), &[], true),
         tool("agent_timeline", "Recent timeline rows of one agent (user messages, assistant text, reasoning, tool calls, notifications), oldest first, long text cut to ~2000 chars.", json!({ "agentId": { "type": "string", "description": "Agent id, a unique id prefix (4+ chars) or the exact title." }, "limit": { "type": "integer", "description": "Rows from the end (default 50, max 500).", "minimum": 1, "maximum": 500 } }), &["agentId"], true),
         tool("agent_processes", "Provider child processes: each live `claude` process (agent id, pid, busy, holding background sub-agents, idle time, RSS/swap from /proc and its descendant processes), prompts waiting for a Claude slot, and the shared `codex app-server` (pid, active turns, memory), plus the daemon's own memory.", json!({}), &[], true),
         tool("daemon_logs", "Recent daemon log lines (info and warnings since start; the last 2000 are kept, long lines cut), oldest first.", json!({ "lines": { "type": "integer", "description": "How many lines from the end (default 200, max 2000).", "minimum": 1, "maximum": 2000 }, "filter": { "type": "string", "description": "Only lines containing this text (case-insensitive)." } }), &[], true),
@@ -291,6 +291,8 @@ impl Manager {
         let include_archived = args.get("includeArchived").and_then(Value::as_bool).unwrap_or(false);
         let mut list: Vec<&Agent> = self.agents.values().filter(|a| include_archived || a.rec.archived_at.is_none()).collect();
         list.sort_by(|a, b| b.rec.updated_at.cmp(&a.rec.updated_at));
+        let total = list.len();
+        list.truncate(args.get("limit").and_then(Value::as_u64).unwrap_or(20).clamp(1, 500) as usize);
         let now = Instant::now();
         let agents: Vec<Value> = list
             .iter()
@@ -329,7 +331,7 @@ impl Manager {
                 })
             })
             .collect();
-        json!({ "count": agents.len(), "agents": agents })
+        json!({ "count": agents.len(), "total": total, "agents": agents })
     }
 
     fn debug_timeline(&self, args: &Value) -> Result<Value, String> {
@@ -678,7 +680,7 @@ mod tests {
     #[tokio::test]
     async fn tool_calls_return_text_content() {
         let (ctx, mut rx) = ctx();
-        crate::util::emit_log("", "mcp-server-test log line".to_string());
+        crate::util::emit_log("", true, "mcp-server-test log line".to_string());
         let r = dispatch(&ctx, json!({ "jsonrpc": "2.0", "id": 6, "method": "tools/call", "params": { "name": "daemon_logs", "arguments": { "filter": "mcp-server-test" } } })).await.unwrap();
         assert_eq!(r["result"]["isError"], false);
         let text: Value = serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();

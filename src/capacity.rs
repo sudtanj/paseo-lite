@@ -382,7 +382,9 @@ fn mem_limit_mb() -> Option<u64> {
 /// CPUs the daemon may use: the affinity mask (`--cpuset-cpus`), capped by
 /// the CFS quota (`--cpus`, cgroup v2 then v1), rounded up.
 fn cpu_count() -> usize {
-    let host = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    // Not available_parallelism(): it already applies the quota, rounded down
+    // (`--cpus 1.75` gives 1), which would cap the rounded-up quota below.
+    let host = affinity_cpus().unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
     let quota = |q: f64, p: f64| (q > 0.0 && p > 0.0).then(|| (q / p).ceil() as usize);
     // v2: "<quota> <period>" or "max <period>".
     let v2 = read("/sys/fs/cgroup/cpu.max").and_then(|v| {
@@ -398,6 +400,24 @@ fn cpu_count() -> usize {
         quota(q, p)
     };
     v2.or_else(v1).map(|q| q.clamp(1, host)).unwrap_or(host)
+}
+
+/// CPUs in the affinity mask (`--cpuset-cpus`), ignoring any quota.
+#[cfg(target_os = "linux")]
+fn affinity_cpus() -> Option<usize> {
+    // SAFETY: cpu_set_t is plain data; sched_getaffinity fills it for this thread.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return None;
+        }
+        Some(libc::CPU_COUNT(&set) as usize).filter(|&n| n > 0)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn affinity_cpus() -> Option<usize> {
+    None
 }
 
 /// Total time the CPU quota held the cgroup back, in µs.
