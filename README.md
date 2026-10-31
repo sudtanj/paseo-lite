@@ -117,7 +117,7 @@ on unsupported features will show errors.
 **Removing a project** (or archiving its last workspace) archives its agents and deletes the local folder
 when that can't lose work: it must be a git repository with no uncommitted changes, no stashes, no
 other worktrees, every commit on a remote, and no ignored files beyond regenerable ones
-(`node_modules`, `target`, `dist`, `.venv`, …), so a `.env` keeps it. A folder paseo-lite created
+(`node_modules`, `target`, `dist`, `.venv`, …, and the runtime state Claude Code keeps under `.claude/`), so a `.env` keeps it. Cloning a repository again onto a kept checkout of it reuses that checkout instead of failing. A folder paseo-lite created
 that is still empty is deleted without checks. Otherwise the folder is kept and the app is told why.
 Whatever the policy, only folders strictly inside your home directory are deleted, never one that
 holds paseo-lite's data or another project. See `PASEO_DELETE_PROJECT_FILES`.

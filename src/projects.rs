@@ -195,6 +195,20 @@ fn normalize_repo(repo: &str, protocol: &str) -> Result<(String, String, String)
     Ok((name.to_string(), format!("{owner}/{name}"), url))
 }
 
+/// Is `dir` the top of a git checkout whose `origin` is the repository
+/// `display` (`owner/repo`, compared case-insensitively)?
+async fn same_repository(dir: &Path, display: &str, protocol: &str) -> bool {
+    let Ok(top) = run("git", &["rev-parse", "--show-toplevel"], Some(dir), Duration::from_secs(10)).await else { return false };
+    if std::fs::canonicalize(top.trim()).ok() != std::fs::canonicalize(dir).ok() {
+        return false;
+    }
+    let Ok(origin) = run("git", &["remote", "get-url", "origin"], Some(dir), Duration::from_secs(10)).await else { return false };
+    match normalize_repo(origin.trim(), protocol) {
+        Ok((_, existing, _)) => existing.eq_ignore_ascii_case(display),
+        Err(_) => false,
+    }
+}
+
 /// Clone into `<target>/<repo name>` via a staging dir, so a failed clone
 /// never leaves a half-populated checkout behind. Uses `git` (which picks up
 /// `gh` as credential helper for private repos).
@@ -211,6 +225,12 @@ pub async fn clone_repository(repo: &str, protocol: &str, target: &str) -> Resul
     let fail = |e: String| (display.clone(), Some(checkout_str.clone()), e);
     std::fs::create_dir_all(&parent).map_err(|e| fail(format!("Cannot create {}: {e}", parent.display())))?;
     if std::fs::symlink_metadata(&checkout).is_ok() {
+        // Cloning again what is already there (a removed project whose files
+        // were kept): reuse that checkout instead of failing.
+        if same_repository(&checkout, &display, protocol).await {
+            crate::log!("github clone of {display}: reusing the existing checkout {checkout_str}");
+            return Ok((display, checkout_str));
+        }
         return Err(fail(format!("Checkout path already exists: {checkout_str}")));
     }
     let staging = parent.join(format!(".paseo-clone-{}", crate::util::new_id()));

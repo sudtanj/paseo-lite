@@ -97,6 +97,46 @@ fn regenerable(rel: &str) -> bool {
     rel.split('/').any(|part| DIRS.contains(&part)) || rel.ends_with(".pyc") || rel.ends_with(".log") || rel.ends_with(".DS_Store")
 }
 
+/// Files Claude Code writes under `.claude/` while it runs (it lists them in
+/// `.git/info/exclude` itself): state, locks and caches, never user work.
+/// Worktrees and local agent memory are not among them.
+fn claude_runtime(rel: &str) -> bool {
+    const FILES: [&str; 5] = ["scheduled_tasks.lock", "scheduled_tasks.json", "agent-registry.json", "first-run", "assistant-daemon-state.json"];
+    const DIRS: [&str; 3] = ["routines/.state", "checkpoints", "mailbox"];
+    let rel = rel.trim_end_matches('/');
+    let Some((_, inner)) = rel.split_once(".claude/").filter(|(before, _)| before.is_empty() || before.ends_with('/')) else { return false };
+    FILES.contains(&inner) || DIRS.iter().any(|d| inner == *d || inner.starts_with(&format!("{d}/")))
+}
+
+/// An ignored path git reports as a whole (`.claude/`): safe to lose when
+/// every file in it is regenerable or Claude Code runtime state.
+fn regenerable_tree(root: &Path, rel: &str) -> bool {
+    let rel = rel.trim_end_matches('/');
+    let path = root.join(rel);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return true };
+    if !meta.is_dir() {
+        return regenerable(rel) || claude_runtime(rel);
+    }
+    if regenerable(rel) || claude_runtime(rel) {
+        return true;
+    }
+    let Ok(entries) = std::fs::read_dir(&path) else { return false };
+    let mut seen = 0;
+    for entry in entries {
+        seen += 1;
+        // A big tree is not Claude's runtime state: keep it.
+        if seen > 200 {
+            return false;
+        }
+        let Ok(entry) = entry else { return false };
+        let child = format!("{rel}/{}", entry.file_name().to_string_lossy());
+        if !regenerable_tree(root, &child) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Why the work in `dir` can't be recovered from a remote; None when it can.
 /// Any git error counts as unrecoverable.
 async fn unrecoverable(dir: &Path) -> Option<String> {
@@ -113,7 +153,7 @@ async fn unrecoverable(dir: &Path) -> Option<String> {
     };
     for line in status.lines().filter(|l| !l.trim().is_empty()) {
         match line.strip_prefix("!! ") {
-            Some(rel) if regenerable(rel) => {}
+            Some(rel) if regenerable(rel) || regenerable_tree(dir, rel.trim()) => {}
             Some(rel) => return Some(format!("it has ignored files git can't restore (e.g. {})", rel.trim())),
             None => return Some("it has uncommitted changes".into()),
         }
@@ -191,6 +231,23 @@ mod tests {
         assert!(regenerable("app.log"));
         assert!(!regenerable(".env"));
         assert!(!regenerable("data/local.sqlite"));
+    }
+
+    #[test]
+    fn claude_runtime_state_is_regenerable() {
+        assert!(claude_runtime(".claude/scheduled_tasks.lock"));
+        assert!(claude_runtime("web/.claude/mailbox/x.json"));
+        assert!(!claude_runtime(".claude/settings.local.json"));
+        assert!(!claude_runtime(".claude/worktrees/feature/src/main.rs"));
+        assert!(!claude_runtime("not.claude/first-run"));
+        let root = std::env::temp_dir().join(format!("paseo-lite-claude-{}", crate::util::new_id()));
+        std::fs::create_dir_all(root.join(".claude/checkpoints")).unwrap();
+        std::fs::write(root.join(".claude/scheduled_tasks.lock"), "{}").unwrap();
+        std::fs::write(root.join(".claude/checkpoints/a"), "x").unwrap();
+        assert!(regenerable_tree(&root, ".claude/"));
+        std::fs::write(root.join(".claude/settings.local.json"), "{}").unwrap();
+        assert!(!regenerable_tree(&root, ".claude/"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
