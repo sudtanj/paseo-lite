@@ -346,7 +346,7 @@ impl Manager {
 // ---- daemon ----
 
 /// Resident memory of the daemon process in KiB (Linux), for status/diagnostics.
-fn rss_kib() -> Option<u64> {
+pub(crate) fn rss_kib() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let line = status.lines().find(|l| l.starts_with("VmRSS:"))?;
     line.split_whitespace().nth(1)?.parse().ok()
@@ -354,7 +354,7 @@ fn rss_kib() -> Option<u64> {
 
 impl Manager {
     /// Agent process / queue state, shared by status and diagnostics.
-    fn runtime_status(&self) -> Value {
+    pub(crate) fn runtime_status(&self) -> Value {
         json!({
             "activeCli": self.active_cli,
             "runningTurns": self.running.len(),

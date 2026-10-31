@@ -9,6 +9,7 @@ mod files;
 mod git_actions;
 mod manager;
 mod mcp;
+mod mcp_server;
 mod projects;
 mod push;
 mod providers;
@@ -48,6 +49,7 @@ ENVIRONMENT (selection):
     PASEO_DEFAULT_SYSTEM_PROMPT  instructions for every agent (default: do not run/test the app locally; set empty to disable)
     PASEO_CLAUDE_SUBAGENT_PROMPT  extra instructions for Claude Code agents (default: hand work to background sub-agents and stay free; set empty to disable)
     PASEO_CLAUDE_MAX_SUBAGENTS    sub-agents one Claude Code agent may run at once; none start while the machine is strained (default 3)
+    PASEO_DEBUG_MCP=0        do not give agents the built-in paseo-lite debug MCP server
 ";
 
 fn hostname() -> String {
@@ -126,9 +128,10 @@ async fn run(cfg: Config, identity: Arc<e2ee::DaemonIdentity>) {
 
     let listen = cfg.listen.clone();
     let hostnames = cfg.hostnames.clone();
+    let debug_mcp = cfg.debug_mcp.clone();
     let server_ctx = ctx.clone();
     let server = tokio::spawn(async move {
-        if let Err(e) = server::serve(server_ctx, listen, hostnames).await {
+        if let Err(e) = server::serve(server_ctx, listen, hostnames, debug_mcp).await {
             crate::warn!("http server failed: {e}");
         }
     });

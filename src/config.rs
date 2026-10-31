@@ -99,6 +99,10 @@ pub struct Config {
     /// zilong-router MCP gateway (`http://<router>:20128/mcp`) given to both CLIs (see mcp.rs).
     pub zilong_mcp_url: Option<String>,
     pub zilong_api_key: Option<String>,
+    /// The daemon's own debug MCP server (`/mcp`, see mcp.rs and
+    /// mcp_server.rs) given to every agent; None when `PASEO_DEBUG_MCP=0` or
+    /// no local URL can be derived from `listen`.
+    pub debug_mcp: Option<crate::mcp::DebugMcp>,
 }
 
 fn env(key: &str) -> Option<String> {
@@ -138,6 +142,8 @@ impl Config {
         let relay_use_tls = env_bool("PASEO_RELAY_USE_TLS").unwrap_or(default_tls);
         let relay_public_endpoint = env("PASEO_RELAY_PUBLIC_ENDPOINT").unwrap_or_else(|| relay_endpoint.clone());
         let relay_public_use_tls = env_bool("PASEO_RELAY_PUBLIC_USE_TLS").unwrap_or(relay_use_tls);
+        let debug_mcp_off = env("PASEO_DEBUG_MCP").map(|v| matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")).unwrap_or(false);
+        let debug_mcp = if debug_mcp_off { None } else { crate::mcp::DebugMcp::for_listen(&listen) };
         Config {
             home,
             listen,
@@ -188,6 +194,7 @@ impl Config {
             claude_max_subagents: env("PASEO_CLAUDE_MAX_SUBAGENTS").and_then(|v| v.parse().ok()).unwrap_or(3),
             zilong_mcp_url: env("PASEO_ZILONG_MCP_URL"),
             zilong_api_key: env(crate::mcp::KEY_ENV),
+            debug_mcp,
         }
     }
 }

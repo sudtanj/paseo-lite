@@ -26,6 +26,7 @@ struct Proc {
     stdin: mpsc::UnboundedSender<String>,
     kill: Option<oneshot::Sender<()>>,
     generation: u64,
+    pid: Option<u32>,
 }
 
 #[derive(Default)]
@@ -119,9 +120,10 @@ impl Codex {
 
     fn spawn(&self) -> Result<(), String> {
         let mut cmd = Command::new(&self.inner.cfg.codex_bin);
-        cmd.arg("app-server").args(crate::mcp::codex_args(&self.inner.cfg)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
+        cmd.arg("app-server").args(crate::mcp::codex_args(&self.inner.cfg)).envs(crate::mcp::codex_env(&self.inner.cfg)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).kill_on_drop(true);
         super::deprioritize(&mut cmd, &self.inner.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.inner.cfg.codex_bin))?;
+        let pid = child.id();
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -131,7 +133,7 @@ impl Codex {
             st.generation += 1;
             st.loaded.clear();
             st.last_activity = Some(Instant::now());
-            st.proc = Some(Proc { stdin: tx, kill: Some(kill_tx), generation: st.generation });
+            st.proc = Some(Proc { stdin: tx, kill: Some(kill_tx), generation: st.generation, pid });
             st.generation
         };
         crate::log!("codex app-server started (shared, generation {generation})");
@@ -443,6 +445,24 @@ impl Codex {
             crate::log!("codex app-server idle; releasing process");
             self.kill();
         }
+    }
+
+    /// The shared app-server's state for the `agent_processes` MCP tool.
+    pub fn debug_status(&self) -> Value {
+        let st = self.inner.state.lock().unwrap();
+        let active: Vec<Value> = st.active.iter().map(|(agent, (thread, turn))| json!({ "agentId": agent, "threadId": thread, "turnId": turn })).collect();
+        json!({
+            "running": st.proc.is_some(),
+            "pid": st.proc.as_ref().and_then(|p| p.pid),
+            "generation": st.generation,
+            "blocked": st.blocked,
+            "activeTurns": active,
+            "loadedThreads": st.loaded.len(),
+            "knownThreads": st.thread_agent.len(),
+            "pendingRequests": st.pending.len(),
+            "openApprovals": st.open_approvals,
+            "idleSecs": st.last_activity.map(|t| t.elapsed().as_secs()),
+        })
     }
 
     pub fn shutdown(&self) {

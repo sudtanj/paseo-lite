@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::SystemTime;
 
 /// Info-level log line (suppressed by `PASEO_LOG_CONSOLE_LEVEL=warn|error`).
@@ -7,7 +9,7 @@ use std::time::SystemTime;
 macro_rules! log {
     ($($arg:tt)*) => {
         if $crate::util::log_enabled(2) {
-            eprintln!("[{}] {}", $crate::util::now_iso(), format!($($arg)*))
+            $crate::util::emit_log("", format!($($arg)*))
         }
     };
 }
@@ -17,9 +19,38 @@ macro_rules! log {
 macro_rules! warn {
     ($($arg:tt)*) => {
         if $crate::util::log_enabled(3) {
-            eprintln!("[{}] WARN {}", $crate::util::now_iso(), format!($($arg)*))
+            $crate::util::emit_log("WARN ", format!($($arg)*))
         }
     };
+}
+
+/// Recent log lines kept in memory for the `daemon_logs` MCP tool (mcp_server.rs):
+/// at most `LOG_KEEP` lines of at most `LOG_LINE_MAX` bytes (~1 MB worst case).
+const LOG_KEEP: usize = 2000;
+const LOG_LINE_MAX: usize = 512;
+static LOG_RING: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+/// Print a log line to stderr and remember it in the ring buffer.
+pub fn emit_log(level: &str, msg: String) {
+    let line = format!("[{}] {level}{msg}", now_iso());
+    eprintln!("{line}");
+    let line = if line.len() > LOG_LINE_MAX { truncate(&line, LOG_LINE_MAX) } else { line };
+    if let Ok(mut ring) = LOG_RING.lock() {
+        if ring.len() >= LOG_KEEP {
+            ring.pop_front();
+        }
+        ring.push_back(line);
+    }
+}
+
+/// The last `lines` log lines (oldest first), optionally only those
+/// containing `filter` (case-insensitive).
+pub fn recent_logs(lines: usize, filter: Option<&str>) -> Vec<String> {
+    let Ok(ring) = LOG_RING.lock() else { return Vec::new() };
+    let filter = filter.map(str::to_ascii_lowercase).filter(|f| !f.is_empty());
+    let mut out: Vec<String> = ring.iter().rev().filter(|l| filter.as_ref().map(|f| l.to_ascii_lowercase().contains(f.as_str())).unwrap_or(true)).take(lines).cloned().collect();
+    out.reverse();
+    out
 }
 
 /// 1=debug 2=info 3=warn 4=error, from `PASEO_LOG_CONSOLE_LEVEL` (default info).
@@ -108,5 +139,17 @@ mod tests {
     #[test]
     fn ids_are_unique() {
         assert_ne!(new_id(), new_id());
+    }
+
+    #[test]
+    fn recent_logs_are_kept_and_filtered() {
+        let marker = format!("ring-test-{}", new_id());
+        emit_log("", format!("{marker} first"));
+        emit_log("WARN ", format!("{marker} second {}", "x".repeat(2000)));
+        let lines = recent_logs(10, Some(&marker.to_ascii_uppercase()));
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].ends_with("first"));
+        assert!(lines[1].contains("WARN ") && lines[1].len() <= LOG_LINE_MAX + "…".len());
+        assert_eq!(recent_logs(1, Some(&marker)).len(), 1);
     }
 }

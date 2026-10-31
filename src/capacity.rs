@@ -126,6 +126,8 @@ pub struct Capacity {
     throttled: Option<(Instant, u64)>,
     /// Throttle share smoothed over ~10 s, like the kernel's avg10.
     throttle_avg: Option<f64>,
+    /// The last time the limit or ceiling moved, and why (for the debug MCP server).
+    last_decision: Option<(String, String)>,
 }
 
 impl Capacity {
@@ -138,7 +140,7 @@ impl Capacity {
             crate::log!("capacity: fixed caps, watching {}", describe_limits(&limits));
         }
         let now = Instant::now();
-        Capacity { auto, agent_mb, max, stable, limits, limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: throttled_usec().map(|t| (now, t)), throttle_avg: None }
+        Capacity { auto, agent_mb, max, stable, limits, limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: throttled_usec().map(|t| (now, t)), throttle_avg: None, last_decision: None }
     }
 
     pub fn limit(&self) -> usize {
@@ -175,9 +177,11 @@ impl Capacity {
         self.limits = limits;
         self.ceiling = ceiling(&limits, self.agent_mb, self.max);
         crate::log!("capacity: limits changed ({}), up to {} agent(s) at once", describe_limits(&limits), self.ceiling);
+        self.note(format!("limits changed ({}), ceiling {}", describe_limits(&limits), self.ceiling));
         if self.auto && self.limit > self.ceiling {
             self.limit = self.ceiling;
             self.last_change = now;
+            self.note(format!("limits changed ({}), limit cut to the new ceiling {}", describe_limits(&limits), self.ceiling));
             return Change::Shrank;
         }
         Change::None
@@ -218,7 +222,9 @@ impl Capacity {
                 self.limit -= 1;
                 self.last_change = now;
                 shrank = true;
-                crate::warn!("capacity: {}, {} agent(s) at once now ({})", if self.critical { "machine nearly out of room" } else { "machine under pressure" }, self.limit, describe(&s));
+                let why = if self.critical { "machine nearly out of room" } else { "machine under pressure" };
+                crate::warn!("capacity: {why}, {} agent(s) at once now ({})", self.limit, describe(&s));
+                self.note(format!("shrank to {}: {why} ({})", self.limit, describe(&s)));
             }
             return if self.critical { Change::Critical } else if shrank { Change::Shrank } else { Change::None };
         }
@@ -238,7 +244,34 @@ impl Capacity {
         // The new agent's load has to prove calm again before the next step.
         self.calm_since = None;
         crate::log!("capacity: machine stable, {} agent(s) at once now ({})", self.limit, describe(&s));
+        self.note(format!("grew to {}: machine stable with turns queued ({})", self.limit, describe(&s)));
         Change::Grew
+    }
+
+    fn note(&mut self, decision: String) {
+        self.last_decision = Some((crate::util::now_iso(), decision));
+    }
+
+    /// `status()` plus what bounds the ceiling and the last limit change,
+    /// for the debug MCP server.
+    pub fn debug_status(&self) -> Value {
+        let mut v = self.status();
+        let l = &self.limits;
+        v["ceilingBy"] = json!({
+            "memory": l.mem_mb.map(|m| m.saturating_sub(RESERVE_MB) / self.agent_mb.max(1)),
+            "cpu": l.cpus.max(1) * 2,
+            "pids": l.pids_max.map(|p| p.saturating_sub(PIDS_RESERVE) / PIDS_PER_AGENT),
+            "max": self.max,
+            "reserveMb": RESERVE_MB,
+        });
+        v["stableSecs"] = json!(self.stable.as_secs());
+        v["calmForSecs"] = json!(self.calm_since.map(|t| t.elapsed().as_secs()));
+        v["lastChangeSecsAgo"] = json!(self.last_change.elapsed().as_secs());
+        v["lastDecision"] = match &self.last_decision {
+            Some((at, what)) => json!({ "at": at, "decision": what }),
+            None => Value::Null,
+        };
+        v
     }
 
     pub fn status(&self) -> Value {
@@ -415,7 +448,7 @@ mod tests {
 
     fn cap(ceiling: usize) -> Capacity {
         let now = Instant::now();
-        Capacity { auto: true, agent_mb: 300, max: 8, stable: Duration::from_secs(30), limits: limits(Some(4096), 4, None), limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: None, throttle_avg: None }
+        Capacity { auto: true, agent_mb: 300, max: 8, stable: Duration::from_secs(30), limits: limits(Some(4096), 4, None), limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: None, throttle_avg: None, last_decision: None }
     }
 
     fn calm() -> Sample {

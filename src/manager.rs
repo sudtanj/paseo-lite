@@ -72,6 +72,8 @@ pub enum Cmd {
     RegisterProject { path: String, out: Out, response: Value },
     /// Push tokens Expo reported as dead.
     RevokePushTokens(Vec<String>),
+    /// A tool of the built-in debug MCP server that reads manager state (mcp_server.rs).
+    Debug { tool: String, args: Value, reply: oneshot::Sender<Result<Value, String>> },
 }
 
 /// What a connected client last reported via `client_heartbeat`.
@@ -254,6 +256,9 @@ impl Manager {
                     Cmd::RegisterProject { path, out, mut response } => {
                         response["payload"]["project"] = self.register_project(&path, true);
                         reply(&out, response);
+                    }
+                    Cmd::Debug { tool, args, reply } => {
+                        let _ = reply.send(self.debug_tool(&tool, &args));
                     }
                     Cmd::RevokePushTokens(tokens) => {
                         for t in tokens {

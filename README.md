@@ -21,7 +21,7 @@ so you can pair it with the Paseo apps exactly like the Node daemon.
 | Usage limits | the turn fails; you send it again after the reset | the turn **waits** for the Claude / Codex usage limit to reset (time read from Claude's rate-limit event or Codex's rate-limit windows), then continues on its own and runs anything queued meanwhile; the chat says when. Sending a message tries again at once; stop cancels (`PASEO_RESUME_AFTER_LIMIT`) |
 | Timelines | in memory | append-only JSONL on disk; streamed chunks merged into one row; unloaded from memory after `PASEO_TIMELINE_UNLOAD_SECS` idle; tool output clipped to 16 KiB |
 | Data use | — | streamed text is sent to the app in ~150 ms batches instead of one message per delta; Claude Code runs with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (no telemetry or update checks); contexts are compacted at `PASEO_AUTO_COMPACT_TOKENS`. `diagnostics` lists the bytes sent to apps per message type |
-| MCP servers | per agent, per provider | one [zilong-router](https://github.com/sudtanj/zilong-router) MCP gateway (`PASEO_ZILONG_MCP_URL`) for every Claude Code and Codex agent, see [MCP: zilong-router](#mcp-zilong-router); Paseo's own agent-control MCP server is not provided |
+| MCP servers | per agent, per provider | one [zilong-router](https://github.com/sudtanj/zilong-router) MCP gateway (`PASEO_ZILONG_MCP_URL`) for every Claude Code and Codex agent, see [MCP: zilong-router](#mcp-zilong-router), plus the built-in `paseo-lite` debug MCP server (see [MCP: paseo-lite](#mcp-paseo-lite)); Paseo's own agent-control MCP server is not provided |
 | Projects | — | a project is just a directory; adding one costs no process and no memory until an agent runs a turn |
 
 Idle cost is the daemon plus one warm process of the active CLI (`claude` or `codex app-server`). Set `PASEO_CODEX_KEEP_WARM=0` / `PASEO_CLAUDE_KEEP_WARM=0` to start them on demand and release them after `PASEO_CODEX_IDLE_SECS` / `PASEO_CLAUDE_IDLE_SECS` instead.
@@ -193,6 +193,7 @@ PASEO_LISTEN=0.0.0.0:6768 PASEO_PASSWORD=secret paseo-lite
 | `PASEO_CLAUDE_MAX_SUBAGENTS` | `3` | sub-agents (foreground or background) one Claude Code agent may run at once. The daemon registers a `PreToolUse` hook for `Agent`/`Task` and refuses further launches, with a reason the model acts on, until one reports back; while the machine is strained (memory or CPU pressure, low free memory) it starts none, and running ones carry on. A hook deny applies in every permission mode, Bypass included. Background shell commands and workflows don't count. `0` = no sub-agents |
 | `PASEO_ZILONG_MCP_URL` | – | zilong-router MCP gateway (`http://<router>:20128/mcp`) for every Claude Code and Codex agent. See [MCP: zilong-router](#mcp-zilong-router) |
 | `PASEO_ZILONG_API_KEY` | – | its API key, sent as a Bearer token |
+| `PASEO_DEBUG_MCP` | on | `0`/`false`/`off` stops giving agents the built-in `paseo-lite` debug MCP server. See [MCP: paseo-lite](#mcp-paseo-lite) |
 
 A systemd unit is in `contrib/paseo-lite.service`.
 
@@ -203,8 +204,8 @@ Set `PASEO_ZILONG_MCP_URL` to a [zilong-router](https://github.com/sudtanj/zilon
 it as one Streamable HTTP server, `zilong-router`, next to the servers in your `~/.claude.json`, project `.mcp.json`
 and `~/.codex/config.toml`. Register the actual MCP servers in the router's dashboard.
 
-- Claude Code: `--mcp-config ~/.paseo-lite/claude-mcp.json`, written at startup with mode 0600 (removed when the URL
-  is unset).
+- Claude Code: `--mcp-config ~/.paseo-lite/claude-mcp.json`, written at startup with mode 0600 (it also holds
+  the `paseo-lite` server below; removed when neither is configured).
 - Codex: `codex app-server -c mcp_servers.zilong-router.url=… -c mcp_servers.zilong-router.bearer_token_env_var="PASEO_ZILONG_API_KEY"`.
 - `PASEO_ZILONG_API_KEY` is sent as `Authorization: Bearer …`; leave it unset for a router on loopback that doesn't
   require keys. The key never appears on a command line, but the agents inherit it in their environment.
@@ -219,6 +220,28 @@ env:
   PASEO_ZILONG_API_KEY: ${{ secrets.PASEO_ZILONG_API_KEY }}
 ```
 
+## MCP: paseo-lite
+
+Every Claude Code and Codex agent (and its sub-agents) also gets `paseo-lite`, an MCP server built into the daemon
+for inspecting and debugging the daemon itself. It is served on the daemon's own listener as `POST /mcp` (Streamable
+HTTP, JSON replies only, no sessions) at `http://127.0.0.1:<port>/mcp`, the port taken from `PASEO_LISTEN`; it is
+disabled, with a warning, when no local address can be derived from it. Requests need `Authorization: Bearer <token>`,
+a random token made at each daemon start, and must come from this machine. Claude Code reads the token from the same
+0600 `--mcp-config` file as zilong-router; Codex from `PASEO_LITE_MCP_TOKEN` on the app-server's environment
+(`bearer_token_env_var`). It never appears on a command line or in the log.
+
+| Tool | What it returns |
+|---|---|
+| `daemon_status` | version, pid, uptime, config with secrets redacted, turn capacity (limit, running, queued, ceiling and what bounds it, last grow/shrink decision), cgroup memory/swap/pids, memory and CPU pressure, load average |
+| `list_agents` | every agent: provider, title, cwd, status, CLI slot or queue position, queued messages, retry/limit state, last activity and error, pending permissions |
+| `agent_timeline` | `{agentId, limit=50}`: the agent's latest timeline rows, long text cut to ~2000 characters |
+| `agent_processes` | live `claude` processes (agent, pid, busy, holding sub-agents, idle time, RSS/swap and descendants from `/proc`), prompts waiting for a slot, the shared `codex app-server` |
+| `daemon_logs` | `{lines=200, filter?}`: recent log lines (the last 2000 are kept in memory) |
+| `list_projects` | projects and workspaces with agent counts |
+| `rpc` | `{message}`: one app-protocol session message through the same handler the app uses, returning its replies. Can change state |
+
+Set `PASEO_DEBUG_MCP=0` to turn it off.
+
 ## Layout
 
 ```
@@ -231,7 +254,8 @@ src/server.rs            HTTP + /ws + embedded UI
 src/relay.rs, e2ee.rs    relay v2 client + NaCl box channel
 src/providers/claude*.rs Claude Code pool + stream-json parser
 src/providers/codex*.rs  shared Codex app-server client + event mapping
-src/mcp.rs               zilong-router MCP gateway as Claude --mcp-config / Codex -c overrides
+src/mcp.rs               MCP servers for agents (zilong-router, paseo-lite) as Claude --mcp-config / Codex -c overrides
+src/mcp_server.rs        the built-in paseo-lite debug MCP server (/mcp)
 src/store.rs             agents.json + JSONL timelines
 src/usage.rs             token/cost ledger per provider and model, price list
 web/index.html           built-in pairing page (QR behind the password)

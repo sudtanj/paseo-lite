@@ -44,6 +44,8 @@ struct Proc {
     sub_active: Arc<std::sync::Mutex<SubAgents>>,
     /// Spawn flags (model, effort) changed mid-turn: restart once the turn ends.
     restart: bool,
+    pid: Option<u32>,
+    spawned_at: Instant,
 }
 
 impl Proc {
@@ -255,6 +257,7 @@ impl ClaudePool {
         cmd.current_dir(&spec.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
         super::deprioritize(&mut cmd, &self.cfg);
         let mut child = cmd.spawn().map_err(|e| format!("failed to start {}: {e}", self.cfg.claude_bin))?;
+        let pid = child.id();
         crate::log!("claude started for agent {} (live={})", spec.id, self.procs.len() + 1);
 
         let mut stdin = child.stdin.take().ok_or("no stdin")?;
@@ -335,7 +338,7 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, restart: false });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, restart: false, pid, spawned_at: Instant::now() });
         Ok(())
     }
 
@@ -459,6 +462,39 @@ impl ClaudePool {
         p.busy.store(true, Ordering::SeqCst);
         p.last_used = Instant::now();
         true
+    }
+
+    /// Live processes and waiting prompts, for the `agent_processes` MCP tool.
+    pub fn debug_status(&self) -> serde_json::Value {
+        let procs: Vec<serde_json::Value> = self
+            .procs
+            .iter()
+            .map(|(id, p)| {
+                let sub = p.sub_active.lock().unwrap();
+                json!({
+                    "agentId": id,
+                    "pid": p.pid,
+                    "generation": p.generation,
+                    "busy": p.busy(),
+                    "holding": sub.holding(),
+                    "subAgentsRunning": sub.running,
+                    "subAgentsQuietSecs": sub.last_seen.map(|t| t.elapsed().as_secs()),
+                    "interrupted": p.interrupted.load(Ordering::SeqCst),
+                    "restartPending": p.restart,
+                    "idleSecs": (!p.busy()).then(|| p.last_used.elapsed().as_secs()),
+                    "ageSecs": p.spawned_at.elapsed().as_secs(),
+                })
+            })
+            .collect();
+        let waiting: Vec<&str> = self.waiting.iter().map(|(spec, _)| spec.id.as_str()).collect();
+        json!({
+            "processes": procs,
+            "waiting": waiting,
+            "maxLive": self.max_live,
+            "occupied": self.occupied(),
+            "strained": self.strained,
+            "subAgentCap": self.sub_cap.load(Ordering::Relaxed),
+        })
     }
 
     /// Stop every child. Returns how many were stopped.

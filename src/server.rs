@@ -2,12 +2,13 @@
 
 use crate::session::{self, Ctx};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use futures_util::{SinkExt, StreamExt};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 const INDEX_HTML: &str = include_str!("../web/index.html");
@@ -16,15 +17,23 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 struct AppState {
     ctx: Arc<Ctx>,
     hostnames: Arc<Vec<String>>,
+    /// The built-in debug MCP server (`/mcp`), when enabled.
+    mcp: Option<Arc<crate::mcp::DebugMcp>>,
 }
 
-pub async fn serve(ctx: Arc<Ctx>, listen: String, hostnames: Vec<String>) -> std::io::Result<()> {
+pub async fn serve(ctx: Arc<Ctx>, listen: String, hostnames: Vec<String>, mcp: Option<crate::mcp::DebugMcp>) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&listen).await?;
-    let state = AppState { ctx, hostnames: Arc::new(hostnames) };
-    let app = Router::new().route("/", get(index)).route("/ws", get(ws_upgrade)).route("/api/files/download", get(download)).with_state(state);
+    let state = AppState { ctx, hostnames: Arc::new(hostnames), mcp: mcp.map(Arc::new) };
+    let app = Router::new()
+        .route("/", get(index))
+        .route("/ws", get(ws_upgrade))
+        .route("/api/files/download", get(download))
+        .route("/mcp", post(mcp_post).get(mcp_other).delete(mcp_other))
+        .with_state(state);
     crate::log!("listening on http://{listen} (web UI) and ws://{listen}/ws");
     // Nagle off: agent stream updates are many small frames.
-    axum::serve(listener, app).tcp_nodelay(true).await
+    // Peer addresses for /mcp, which only answers this machine.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).tcp_nodelay(true).await
 }
 
 /// The pairing page. It holds no daemon data itself (that comes over `/ws`
@@ -85,10 +94,29 @@ async fn download(State(state): State<AppState>, headers: HeaderMap, uri: axum::
         .unwrap_or_else(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to read file"))
 }
 
+/// `POST /mcp`: the built-in debug MCP server (mcp_server.rs). 404 when it is
+/// disabled; loopback peers with the bearer token only.
+async fn mcp_post(State(state): State<AppState>, ConnectInfo(peer): ConnectInfo<SocketAddr>, headers: HeaderMap, body: axum::body::Bytes) -> Response {
+    let Some(mcp) = state.mcp.clone() else { return StatusCode::NOT_FOUND.into_response() };
+    if !host_allowed(&headers, &state.hostnames) {
+        return (StatusCode::FORBIDDEN, "Host not allowed").into_response();
+    }
+    crate::mcp_server::handle(&state.ctx, &mcp, peer, &headers, &body).await
+}
+
+/// Streamable HTTP's GET (server-sent events) and DELETE (session end): this
+/// server keeps no sessions and sends no server-initiated messages.
+async fn mcp_other(State(state): State<AppState>) -> Response {
+    if state.mcp.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "POST")]).into_response()
+}
+
 /// DNS-rebinding guard, same policy as the Node daemon: IP literals and
 /// localhost are always accepted; other names only when listed in
 /// `PASEO_HOSTNAMES` (a leading dot matches the domain and its subdomains).
-fn host_allowed(headers: &HeaderMap, extra: &[String]) -> bool {
+pub(crate) fn host_allowed(headers: &HeaderMap, extra: &[String]) -> bool {
     let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) else { return true };
     let host = host.trim().to_ascii_lowercase();
     let name = if let Some(rest) = host.strip_prefix('[') {
