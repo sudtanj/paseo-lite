@@ -27,7 +27,7 @@ so you can pair it with the Paseo apps exactly like the Node daemon.
 Idle cost is the daemon plus one warm process of the active CLI (`claude` or `codex app-server`). Set `PASEO_CODEX_KEEP_WARM=0` / `PASEO_CLAUDE_KEEP_WARM=0` to start them on demand and release them after `PASEO_CODEX_IDLE_SECS` / `PASEO_CLAUDE_IDLE_SECS` instead.
 
 <!-- bench:summary -->
-On a simulated GCP e2-micro (free tier) the daemon is listening 1.38 s after start and idles at 8.5 MiB RSS; a follow-up turn takes 0.81 s end to end, and 6 chats at once, 3 turns each finish in 15.58 s with the daemon peaking at 8.6 MiB RSS (0 errors; see [Benchmark](#benchmark)).
+On a simulated GCP e2-micro (free tier) the daemon is listening 0.18 s after start and idles at 8.5 MiB RSS; a follow-up turn takes 0.81 s end to end, and 6 chats at once, 3 turns each finish in 11.30 s with the daemon peaking at 8.6 MiB RSS (0 errors; see [Benchmark](#benchmark)).
 <!-- /bench:summary -->
 
 ## Relay and pairing
@@ -325,69 +325,69 @@ BENCH_SYSTEMS=gcp-e2-micro,vps-512m cargo test --release --test bench -- --ignor
 <!-- bench:report -->
 #### x86_64 runner
 
-Measured 2026-10-31 on x86_64 at commit `e46a3fc`, binary 3.2 MiB. The fake `claude` holds 200 MiB and streams each turn in about 1 s (5 text deltas, a tool call, a final message).
+Measured 2026-10-31 on x86_64 at commit `1b08d55`, binary 3.2 MiB. The fake `claude` holds 200 MiB and streams each turn in about 1 s (5 text deltas, a tool call, a final message).
 
 ### GCP e2-micro (free tier): 1 GB, 0.25 vCPU sustained
 
-`--memory 1g --cpus 0.25` (`gcp-e2-micro`). Listening 1.38 s after `docker run`; idle 3 s later: daemon 8.5 MiB RSS, container 3.8 MiB.
+`--memory 1g --cpus 0.25` (`gcp-e2-micro`). Listening 0.18 s after `docker run`; idle 3 s later: daemon 8.5 MiB RSS, container 4.2 MiB.
 
 | Scenario | Turns | Errors | Wall | p50 turn | p99 turn | Peak daemon RSS | Peak container memory | Peak `claude` processes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 chat, first turn (starts the CLI) | 1 | 0 | 1.26 s | 1.26 s | 1.26 s | 8.6 MiB | 231.0 MiB | 1 |
-| 1 chat, 9 more turns | 9 | 0 | 7.54 s | 0.81 s | 0.89 s | 8.6 MiB | 231.0 MiB | 1 |
-| 6 chats at once, 3 turns each | 18 | 0 | 15.58 s | 4.80 s | 5.71 s | 8.6 MiB | 457.5 MiB | 2 |
+| 1 chat, first turn (starts the CLI) | 1 | 0 | 1.06 s | 1.06 s | 1.06 s | 8.6 MiB | 231.0 MiB | 1 |
+| 1 chat, 9 more turns | 9 | 0 | 7.27 s | 0.81 s | 0.81 s | 8.6 MiB | 231.0 MiB | 1 |
+| 6 chats at once, 3 turns each | 18 | 0 | 11.30 s | 3.61 s | 4.00 s | 8.6 MiB | 457.4 MiB | 2 |
 
-Auto capacity: limit 1 (ceiling 2) from 1024 MB and 1 CPU(s) seen in the cgroup. OOM kills: 0.
+Auto capacity: limit 2 (ceiling 2) from 1024 MB and 1 CPU(s) seen in the cgroup. OOM kills: 0.
 
 ### 512 MB VPS: 512 MB, 1 vCPU
 
-`--memory 512m --cpus 1` (`vps-512m`). Listening 0.11 s after `docker run`; idle 3 s later: daemon 8.5 MiB RSS, container 4.2 MiB.
+`--memory 512m --cpus 1` (`vps-512m`). Listening 0.09 s after `docker run`; idle 3 s later: daemon 8.5 MiB RSS, container 4.4 MiB.
 
 | Scenario | Turns | Errors | Wall | p50 turn | p99 turn | Peak daemon RSS | Peak container memory | Peak `claude` processes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.93 s | 0.93 s | 0.93 s | 8.7 MiB | 231.1 MiB | 1 |
-| 1 chat, 9 more turns | 9 | 0 | 7.36 s | 0.81 s | 0.84 s | 8.7 MiB | 231.1 MiB | 1 |
-| 6 chats at once, 3 turns each | 18 | 0 | 16.63 s | 5.54 s | 5.56 s | 8.7 MiB | 395.8 MiB | 1 |
+| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.90 s | 0.90 s | 0.90 s | 8.6 MiB | 231.0 MiB | 1 |
+| 1 chat, 9 more turns | 9 | 0 | 7.27 s | 0.81 s | 0.81 s | 8.6 MiB | 231.0 MiB | 1 |
+| 6 chats at once, 3 turns each | 18 | 0 | 16.06 s | 5.33 s | 5.37 s | 8.6 MiB | 231.0 MiB | 1 |
 
 Auto capacity: limit 1 (ceiling 1) from 512 MB and 1 CPU(s) seen in the cgroup. OOM kills: 0.
 
 ### Small VPS: 4 GB, 2 vCPU
 
-`--memory 4g --cpus 2` (`vps-2c-4g`). Listening 0.10 s after `docker run`; idle 3 s later: daemon 8.6 MiB RSS, container 4.3 MiB.
+`--memory 4g --cpus 2` (`vps-2c-4g`). Listening 0.09 s after `docker run`; idle 3 s later: daemon 8.5 MiB RSS, container 4.3 MiB.
 
 | Scenario | Turns | Errors | Wall | p50 turn | p99 turn | Peak daemon RSS | Peak container memory | Peak `claude` processes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.94 s | 0.94 s | 0.94 s | 8.7 MiB | 231.1 MiB | 1 |
-| 1 chat, 9 more turns | 9 | 0 | 7.31 s | 0.81 s | 0.82 s | 8.7 MiB | 231.1 MiB | 1 |
-| 6 chats at once, 3 turns each | 18 | 0 | 8.87 s | 2.75 s | 3.36 s | 8.7 MiB | 457.4 MiB | 2 |
+| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.89 s | 0.89 s | 0.89 s | 8.6 MiB | 231.1 MiB | 1 |
+| 1 chat, 9 more turns | 9 | 0 | 7.28 s | 0.81 s | 0.81 s | 8.6 MiB | 231.1 MiB | 1 |
+| 6 chats at once, 3 turns each | 18 | 0 | 8.69 s | 2.66 s | 3.36 s | 8.6 MiB | 457.2 MiB | 2 |
 
 Auto capacity: limit 2 (ceiling 4) from 4096 MB and 2 CPU(s) seen in the cgroup. OOM kills: 0.
 
 #### aarch64 runner
 
-Measured 2026-10-31 on aarch64 at commit `e46a3fc`, binary 2.7 MiB. The fake `claude` holds 200 MiB and streams each turn in about 1 s (5 text deltas, a tool call, a final message).
+Measured 2026-10-31 on aarch64 at commit `1b08d55`, binary 2.7 MiB. The fake `claude` holds 200 MiB and streams each turn in about 1 s (5 text deltas, a tool call, a final message).
 
 ### 1 GB single-board computer (Orange Pi Zero 3, Raspberry Pi 3): 1 GB, 4 cores
 
-`--memory 1g --cpus 4` (`sbc-1g`). Listening 0.25 s after `docker run`; idle 3 s later: daemon 7.4 MiB RSS, container 4.1 MiB.
+`--memory 1g --cpus 4` (`sbc-1g`). Listening 1.00 s after `docker run`; idle 3 s later: daemon 7.4 MiB RSS, container 3.9 MiB.
 
 | Scenario | Turns | Errors | Wall | p50 turn | p99 turn | Peak daemon RSS | Peak container memory | Peak `claude` processes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.91 s | 0.91 s | 0.91 s | 7.4 MiB | 231.0 MiB | 1 |
-| 1 chat, 9 more turns | 9 | 0 | 7.33 s | 0.81 s | 0.82 s | 7.4 MiB | 231.0 MiB | 1 |
-| 6 chats at once, 3 turns each | 18 | 0 | 8.64 s | 2.66 s | 3.33 s | 7.4 MiB | 457.1 MiB | 2 |
+| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.90 s | 0.90 s | 0.90 s | 7.4 MiB | 231.0 MiB | 1 |
+| 1 chat, 9 more turns | 9 | 0 | 7.32 s | 0.81 s | 0.82 s | 7.4 MiB | 231.0 MiB | 1 |
+| 6 chats at once, 3 turns each | 18 | 0 | 8.63 s | 2.66 s | 3.30 s | 7.4 MiB | 457.1 MiB | 2 |
 
 Auto capacity: limit 2 (ceiling 3) from 1024 MB and 4 CPU(s) seen in the cgroup. OOM kills: 0.
 
 ### OCI Ampere A1 (free tier, scaled to the runner): 12 GB, 4 OCPU
 
-`--memory 12g --cpus 4` (`oci-a1`). Listening 0.15 s after `docker run`; idle 3 s later: daemon 7.3 MiB RSS, container 4.3 MiB.
+`--memory 12g --cpus 4` (`oci-a1`). Listening 0.11 s after `docker run`; idle 3 s later: daemon 7.4 MiB RSS, container 4.1 MiB.
 
 | Scenario | Turns | Errors | Wall | p50 turn | p99 turn | Peak daemon RSS | Peak container memory | Peak `claude` processes |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.89 s | 0.89 s | 0.89 s | 7.3 MiB | 231.0 MiB | 1 |
-| 1 chat, 9 more turns | 9 | 0 | 7.31 s | 0.81 s | 0.81 s | 7.3 MiB | 231.0 MiB | 1 |
-| 6 chats at once, 3 turns each | 18 | 0 | 8.66 s | 2.66 s | 3.34 s | 7.3 MiB | 457.1 MiB | 2 |
+| 1 chat, first turn (starts the CLI) | 1 | 0 | 0.89 s | 0.89 s | 0.89 s | 7.4 MiB | 230.9 MiB | 1 |
+| 1 chat, 9 more turns | 9 | 0 | 7.32 s | 0.81 s | 0.82 s | 7.4 MiB | 230.9 MiB | 1 |
+| 6 chats at once, 3 turns each | 18 | 0 | 8.65 s | 2.65 s | 3.34 s | 7.4 MiB | 457.1 MiB | 2 |
 
 Auto capacity: limit 2 (ceiling 8) from 12288 MB and 4 CPU(s) seen in the cgroup. OOM kills: 0.
 <!-- /bench:report -->
