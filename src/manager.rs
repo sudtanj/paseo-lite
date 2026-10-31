@@ -1185,7 +1185,7 @@ impl Manager {
             // Only background sub-agents left: Stop ends them and frees the slot.
             if agent.rec.provider == "claude" {
                 if let Some(ready) = self.claude.stop_sub_agents(agent_id) {
-                    self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": "Stopped the background sub-agents" }));
+                    self.append_item(agent_id, json!({ "type": "notification", "level": "info", "message": "Stopped the background work" }));
                     self.send_ready(ready);
                     self.publish_agent(agent_id);
                 }
@@ -1484,7 +1484,7 @@ const LIMIT_FIRST_POLL: Duration = Duration::from_secs(60);
 /// Sent when the usage limit has reset and a turn it stopped carries on.
 const LIMIT_PROMPT: &str = "The usage or rate limit that stopped you has reset. Continue from where you left off and finish the task.";
 /// Sent when the turn the CLI ran on background sub-agents' reports has to be retried.
-const SUBAGENT_REPORT_PROMPT: &str = "Your background sub-agents reported back while you were idle. Check their results and continue the task with them. If a sub-agent failed, say so and re-launch it if the work is still needed.";
+const SUBAGENT_REPORT_PROMPT: &str = "Your background sub-agents, shell commands or workflows reported back while you were idle. Check their results and continue the task with them. If one failed, say so and re-launch it if the work is still needed.";
 /// Sent when the limit that stopped sub-agents (yours or background ones) has reset.
 const SUBAGENT_LIMIT_PROMPT: &str = "Some of your sub-agents stopped early because of the usage or rate limit, which has now reset. Check what they left unfinished and finish it, re-launching them if needed. If nothing is left to do, say so briefly.";
 

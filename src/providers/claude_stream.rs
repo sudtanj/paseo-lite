@@ -30,10 +30,11 @@ pub struct StreamState {
     sub_limited: bool,
     /// Task tool_use_id -> the running sub-agent's action log.
     sub_logs: HashMap<String, Vec<String>>,
-    /// Task tool_use_id -> (name, input) of sub-agents running in the background.
+    /// tool_use_id -> (name, input) of work running in the background:
+    /// sub-agents, shell commands and workflows.
     background: HashMap<String, (String, Value)>,
-    /// Whether background sub-agents are running and when they last showed
-    /// activity. The pool keeps the process alive while they work.
+    /// Whether background work is running and when it last showed activity.
+    /// The pool keeps the process alive while it works.
     pub sub_active: Arc<Mutex<SubAgents>>,
     /// How many sub-agents may run at once, set by the pool from the
     /// machine's state (0 = start no new ones).
@@ -51,27 +52,65 @@ const ADMIT_GRACE: Duration = Duration::from_secs(30);
 
 /// Lines kept in a running sub-agent's log (the oldest are dropped).
 const MAX_SUB_LOG_LINES: usize = 50;
-/// Background sub-agents tracked at once.
+/// Background tasks tracked at once.
 const MAX_BACKGROUND: usize = 32;
 /// A background sub-agent silent for this long is taken for hung: its
 /// process may then be reaped or evicted like any idle one.
 const SUBAGENT_QUIET_MAX: Duration = Duration::from_secs(30 * 60);
+/// The same for background shells and workflows, which show no progress
+/// until they report: as long as Bash lets a background command run.
+const BACKGROUND_QUIET_MAX: Duration = Duration::from_secs(2 * 60 * 60);
 /// Kept after the last sub-agent reports, while the manager opens the turn
 /// the CLI runs on its result.
 const SUBAGENT_GRACE: Duration = Duration::from_secs(15);
 
-/// A process's background sub-agents, as the pool sees them.
+/// A process's background work (sub-agents, shells, workflows), as the pool
+/// sees it.
 #[derive(Default)]
 pub struct SubAgents {
     pub running: bool,
     pub last_seen: Option<Instant>,
+    /// Silence after which running work is taken for hung.
+    pub quiet_max: Duration,
 }
 
 impl SubAgents {
     /// Whether the process must stay up for them.
     pub fn holding(&self) -> bool {
         let quiet = self.last_seen.map(|t| t.elapsed()).unwrap_or(Duration::MAX);
-        quiet < if self.running { SUBAGENT_QUIET_MAX } else { SUBAGENT_GRACE }
+        quiet < if self.running { self.quiet_max } else { SUBAGENT_GRACE }
+    }
+}
+
+fn is_agent_tool(name: &str) -> bool {
+    matches!(name, "Task" | "Agent")
+}
+
+/// Does this successful tool result mean the work runs on in the background
+/// and reports back with a `<task-notification>`? Workflows always do, shell
+/// commands when asked to, sub-agents say so in their short launch answer
+/// (a foreground sub-agent's final report must not be taken for one).
+fn launched_in_background(name: &str, input: &Value, output: &str) -> bool {
+    let asked = input.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
+    match name {
+        "Workflow" => true,
+        "Bash" | "PowerShell" => asked || output.starts_with("Command running in background with ID:"),
+        "Task" | "Agent" => {
+            if output.starts_with("Async agent launched") {
+                return true;
+            }
+            // Forks, and sub-agents that run in the background by default,
+            // may not set the flag, and the wording varies: a launch answer
+            // is short, and its first line is about the agent starting.
+            let asked = asked || s(input, "subagent_type").as_deref() == Some("fork");
+            let text = output.trim_start().to_lowercase();
+            let first = text.lines().next().unwrap_or("");
+            let about_agent = ["agent", "fork", "background"].iter().any(|w| first.contains(w));
+            let started = first.contains("launched") || first.contains("started");
+            let notice = text.contains("in the background") || text.contains("will be notified");
+            about_agent && ((started && text.len() < 2000) || (notice && text.len() < 1000) || (asked && text.len() < 300))
+        }
+        _ => false,
     }
 }
 
@@ -202,9 +241,12 @@ impl StreamState {
         }
     }
 
-    /// Tell the pool whether background sub-agents are still at work.
+    /// Tell the pool whether background work is still running. Shells and
+    /// workflows show no activity until they report, so they may stay quiet
+    /// longer than sub-agents before they count as hung.
     fn note_background(&self) {
-        *self.sub_active.lock().unwrap() = SubAgents { running: !self.background.is_empty(), last_seen: Some(Instant::now()) };
+        let quiet_max = if self.background.values().all(|(name, _)| is_agent_tool(name)) { SUBAGENT_QUIET_MAX } else { BACKGROUND_QUIET_MAX };
+        *self.sub_active.lock().unwrap() = SubAgents { running: !self.background.is_empty(), last_seen: Some(Instant::now()), quiet_max };
     }
 
     /// A Task card whose log is the sub-agent's actions so far.
@@ -239,8 +281,8 @@ impl StreamState {
         self.timeline(self.sub_agent_card(&parent, &name, &input, "running"));
     }
 
-    /// Background sub-agents that reported back (`<task-notification>`): their
-    /// cards get the final result. The CLI then runs a turn of its own on
+    /// Background work that reported back (`<task-notification>`): its cards
+    /// get the final result. The CLI then runs a turn of its own on
     /// them, which the manager is told to open.
     fn finish_background(&mut self, content: &Value) {
         let text = content_text(content);
@@ -266,13 +308,16 @@ impl StreamState {
         self.note_background();
     }
 
-    /// The process is gone and the background sub-agents it was running died
-    /// with it: fail their cards instead of leaving them running.
+    /// The process is gone and the background work it was running died with
+    /// it: fail the cards instead of leaving them running.
     pub fn process_ended(&mut self, killed: bool) {
         let error = if killed { "Stopped before it reported back: its Claude Code process was shut down" } else { "Stopped before it reported back: its Claude Code process exited" };
         for (id, (name, input)) in std::mem::take(&mut self.background) {
             let mut detail = tools::claude_detail(&name, &input, None);
-            detail["log"] = json!(self.sub_logs.remove(&id).map(|l| l.join("\n")).unwrap_or_default());
+            let log = self.sub_logs.remove(&id);
+            if log.is_some() || is_agent_tool(&name) {
+                detail["log"] = json!(log.map(|l| l.join("\n")).unwrap_or_default());
+            }
             self.timeline(tools::tool_call(&id, &name, detail, "failed", Some(error.into())));
         }
         self.note_background();
@@ -293,10 +338,12 @@ impl StreamState {
             let Some((name, input)) = self.tools.remove(&id) else { continue };
             let output = content_text(block.get("content").unwrap_or(&Value::Null));
             let failed = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-            if matches!(name.as_str(), "Task" | "Agent") && !failed && output.starts_with("Async agent launched") {
-                // It runs on in the background: the card keeps listing what it
-                // does until its notification (the launch text is internal).
-                self.timeline(self.sub_agent_card(&id, &name, &input, "running"));
+            if !failed && launched_in_background(&name, &input, &output) {
+                // It runs on in the background: the card stays running (a
+                // sub-agent's keeps listing what it does) until its
+                // notification. The launch text is internal.
+                let card = if is_agent_tool(&name) { self.sub_agent_card(&id, &name, &input, "running") } else { tools::tool_call(&id, &name, tools::claude_detail(&name, &input, None), "running", None) };
+                self.timeline(card);
                 if self.background.len() < MAX_BACKGROUND {
                     self.background.insert(id, (name, input));
                     self.note_background();
@@ -306,7 +353,7 @@ impl StreamState {
             self.sub_logs.remove(&id);
             self.admitted.remove(&id);
             // A sub-agent that died on the limit reports it as its result.
-            if matches!(name.as_str(), "Task" | "Agent") && output.len() < 2000 && output.contains("API Error") && super::is_usage_limit(&output) {
+            if is_agent_tool(&name) && output.len() < 2000 && output.contains("API Error") && super::is_usage_limit(&output) {
                 self.sub_limited = true;
             }
             let detail = tools::claude_detail(&name, &input, Some(&output));
@@ -336,7 +383,7 @@ impl StreamState {
             let _ = self.events.send(ProviderEvent::Timeline { agent_id: agent_id.clone(), item: tools::tool_call(&id, &name, detail, "canceled", None) });
         }
         self.streamed.clear();
-        // Background sub-agents outlive the turn that launched them.
+        // Background work outlives the turn that launched it.
         let background = &self.background;
         self.sub_logs.retain(|id, _| background.contains_key(id));
         let ok = s(msg, "subtype").as_deref() == Some("success") && !msg.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -389,7 +436,8 @@ impl StreamState {
     /// The `PreToolUse` hook for Agent/Task: let a sub-agent start while fewer
     /// than `sub_cap` are running (foreground or background), else deny it
     /// with a reason the model can act on. Deny wins over every permission
-    /// mode, Bypass included.
+    /// mode, Bypass included. Only launches this hook let through count, so
+    /// background shells and workflows never take a sub-agent's place.
     fn gate_subagent(&mut self, req: &Value) -> Value {
         let now = Instant::now();
         let (tools, background) = (&self.tools, &self.background);
@@ -733,6 +781,102 @@ mod tests {
         let last = timeline(events).pop().expect("a card");
         assert_eq!(last["status"], "failed");
         assert_eq!(last["detail"]["log"], "[Bash] ls src");
+    }
+
+    #[test]
+    fn background_shells_and_workflows_hold_the_process_until_they_report() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        let lines = [
+            json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": "toolu_w", "name": "Workflow", "input": { "script": "review.js" } },
+                { "type": "tool_use", "id": "toolu_b", "name": "Bash", "input": { "command": "cargo build", "run_in_background": true } },
+            ] } }),
+            json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_w", "content": "Workflow started in the background (task id wf1)." },
+                { "type": "tool_result", "tool_use_id": "toolu_b", "content": "Command running in background with ID: bgmz5vjgy. Output is being written to: /tmp/bgmz5vjgy.out" },
+            ] } }),
+            json!({ "type": "result", "subtype": "success", "result": "Started." }),
+        ];
+        for line in &lines {
+            st.handle_line(&line.to_string());
+        }
+        let held = |st: &StreamState| {
+            let sub = st.sub_active.lock().unwrap();
+            (sub.running, sub.quiet_max)
+        };
+        assert_eq!(held(&st), (true, BACKGROUND_QUIET_MAX));
+        assert!(st.sub_active.lock().unwrap().holding());
+        let shell = "<task-notification>\n<task-id>bgmz5vjgy</task-id>\n<tool-use-id>toolu_b</tool-use-id>\n<status>completed</status>\n<summary>Background command \"cargo build\" completed (exit code 0)</summary>\n</task-notification>";
+        st.handle_line(&json!({ "type": "user", "message": { "content": shell } }).to_string());
+        // The workflow still runs.
+        assert!(held(&st).0);
+        let flow = "<task-notification>\n<task-id>wf1</task-id>\n<tool-use-id>toolu_w</tool-use-id>\n<status>stopped</status>\n<summary>Workflow stopped</summary>\n</task-notification>";
+        st.handle_line(&json!({ "type": "user", "message": { "content": flow } }).to_string());
+        assert!(!held(&st).0);
+        let mut items = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ProviderEvent::Timeline { item, .. } = ev {
+                items.push(item);
+            }
+        }
+        let cards = |id: &str| -> Vec<Value> { items.iter().filter(|i| i["callId"] == id).cloned().collect() };
+        let (bash, flow) = (cards("toolu_b"), cards("toolu_w"));
+        // Call, launch (still running), notification.
+        assert_eq!(bash.len(), 3);
+        assert_eq!(bash[1]["status"], "running");
+        assert_eq!(bash[1]["detail"]["type"], "shell");
+        assert!(bash[1]["detail"].get("log").is_none());
+        assert_eq!(bash[2]["status"], "completed");
+        assert_eq!(bash[2]["detail"]["output"], "Background command \"cargo build\" completed (exit code 0)");
+        assert_eq!(flow.len(), 3);
+        assert_eq!(flow[1]["status"], "running");
+        assert_eq!(flow[2]["status"], "canceled");
+    }
+
+    #[test]
+    fn foreground_results_are_not_taken_for_background_launches() {
+        let call = |id: &str, name: &str, input: Value| json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] } });
+        let result = |id: &str, text: &str| json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": text }] } });
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        let lines = [
+            call("t1", "Agent", json!({ "description": "Find it" })),
+            result("t1", "Found it: the agent loop starts in src/main.rs at line 40.\nagentId: a1 (for resuming)"),
+            call("t2", "Task", json!({ "description": "Deploy" })),
+            result("t2", "Launched the server and checked it answers on :8080."),
+            call("t3", "Bash", json!({ "command": "echo started in the background" })),
+            result("t3", "started in the background"),
+        ];
+        for line in &lines {
+            st.handle_line(&line.to_string());
+        }
+        assert!(!st.sub_active.lock().unwrap().running);
+        assert!(st.background.is_empty());
+
+        // A fork's launch answer counts, whatever its wording.
+        assert!(launched_in_background("Agent", &json!({ "subagent_type": "fork" }), "Fork started.\nagentId: f1"));
+        assert!(launched_in_background("Agent", &json!({}), "Async agent launched successfully.\nagentId: a1"));
+        assert!(!launched_in_background("Agent", &json!({ "subagent_type": "fork" }), &format!("The agent finished: {}", "x".repeat(400))));
+    }
+
+    #[test]
+    fn subagent_gate_ignores_background_shells() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let (stdin, mut out) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        st.sub_cap.store(1, Ordering::Relaxed);
+        for id in ["b1", "b2"] {
+            st.handle_line(&json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": "Bash", "input": { "command": "make", "run_in_background": true } }] } }).to_string());
+            st.handle_line(&json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": format!("Command running in background with ID: {id}.") }] } }).to_string());
+        }
+        assert_eq!(st.background.len(), 2);
+        let hook = json!({ "type": "control_request", "request_id": "r1", "request": { "subtype": "hook_callback", "callback_id": SUBAGENT_HOOK, "input": { "hook_event_name": "PreToolUse", "tool_name": "Agent" }, "tool_use_id": "t1" } });
+        st.handle_line(&hook.to_string());
+        let resp: Value = serde_json::from_str(&out.try_recv().expect("an answer")).unwrap();
+        assert!(resp.pointer("/response/response/hookSpecificOutput").is_none());
     }
 
     #[test]
