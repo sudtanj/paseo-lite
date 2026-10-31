@@ -1,9 +1,10 @@
 //! How many agent turns may run at once.
 //!
 //! With `auto` (the default) the limit adapts to the machine: it starts at
-//! one, grows by one while turns are queued and the machine has stayed calm
-//! for `stable` (low memory/CPU pressure, no CPU throttling, room for another
-//! agent), and shrinks by one when pressure builds up. It never exceeds the
+//! the ceiling, so a fresh daemon uses the whole machine at once, shrinks by
+//! one when pressure builds up, and grows back by one while turns are queued
+//! and the machine has stayed calm for `stable` (low memory/CPU pressure, no
+//! CPU throttling, room for another agent). It never exceeds the
 //! ceiling: what the memory limit fits at `agent_mb` per agent, the CPU count
 //! times two, what the pids limit fits, and `max`. Running turns are never
 //! stopped; a lower limit only holds back the next ones, which wait in the
@@ -140,7 +141,7 @@ impl Capacity {
             crate::log!("capacity: fixed caps, watching {}", describe_limits(&limits));
         }
         let now = Instant::now();
-        Capacity { auto, agent_mb, max, stable, limits, limits_at: now, ceiling, limit: 1, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: throttled_usec().map(|t| (now, t)), throttle_avg: None, last_decision: None }
+        Capacity { auto, agent_mb, max, stable, limits, limits_at: now, ceiling, limit: if auto { ceiling } else { 1 }, calm_since: None, last_change: now, last: Sample::default(), strained: false, critical: false, throttled: throttled_usec().map(|t| (now, t)), throttle_avg: None, last_decision: None }
     }
 
     pub fn limit(&self) -> usize {
