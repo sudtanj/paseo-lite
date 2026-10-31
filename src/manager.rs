@@ -275,7 +275,7 @@ impl Manager {
         while stopping > 0 {
             match tokio::time::timeout_at(deadline, events.recv()).await {
                 Ok(Some(ProviderEvent::ProcessExited { .. })) => stopping -= 1,
-                Ok(Some(ProviderEvent::Timeline { agent_id, item })) if item.pointer("/detail/type").and_then(|t| t.as_str()) == Some("sub_agent") => self.append_item(&agent_id, item),
+                Ok(Some(ProviderEvent::Timeline { agent_id, item })) if item.get("type").and_then(|t| t.as_str()) == Some("tool_call") => self.append_item(&agent_id, item),
                 Ok(Some(_)) => {}
                 _ => break,
             }
@@ -988,8 +988,8 @@ impl Manager {
                 let last = a.timeline.as_ref().and_then(|t| t.last())?;
                 let kind = last.item.get("type").and_then(|t| t.as_str());
                 let status = last.item.get("status").and_then(|t| t.as_str());
-                // A sub-agent left running in the background is not a stop (retrying would kill it).
-                let background = status == Some("running") && last.item.pointer("/detail/type").and_then(|t| t.as_str()) == Some("sub_agent");
+                // Work left running in the background (a sub-agent, shell or workflow) is not a stop: retrying would kill it.
+                let background = status == Some("running");
                 (kind == Some("tool_call") && matches!(status, Some("canceled") | Some("running")) && !background).then(|| "the model stopped in the middle of a tool call".into())
             }
             Ok(Some(_)) => None,
@@ -1051,10 +1051,11 @@ impl Manager {
         true
     }
 
-    /// Background sub-agents reported back after the turn that launched them,
-    /// and the CLI runs a turn of its own on their results. Open one here so
-    /// the app shows the agent's reply (and notifies when it is done) instead
-    /// of dropping it. A turn already running simply takes the reports in.
+    /// The CLI started a turn of its own while none was open here: background
+    /// work (sub-agents, shells, workflows) reported back after the turn that
+    /// launched it. Open one so the app shows the agent's reply (and notifies
+    /// when it is done) instead of dropping it. A turn already running simply
+    /// takes the output in.
     fn open_background_turn(&mut self, agent_id: &str) {
         let idle = self.agents.get(agent_id).map(|a| a.status != "running" && a.rec.archived_at.is_none()).unwrap_or(false);
         // A late report from a process already shut down opens nothing.
@@ -1080,7 +1081,7 @@ impl Manager {
             a.rec.attention_reason = None;
             a.rec.provider.clone()
         };
-        crate::log!("agent {agent_id}: background sub-agents reported back; the CLI continues on its own");
+        crate::log!("agent {agent_id}: background work reported back; the CLI continues on its own");
         // Its process already holds a slot: account for the turn on it.
         self.running.insert(agent_id.to_string());
         self.stream(agent_id, &provider, json!({ "type": "turn_started", "provider": provider, "turnId": turn_id }));
@@ -1245,8 +1246,10 @@ impl Manager {
                         a.produced = true;
                     }
                     self.buffer_chunk(&agent_id, item);
-                } else if item.pointer("/detail/type").and_then(|t| t.as_str()) == Some("sub_agent") && self.agents.contains_key(&agent_id) {
-                    // A background sub-agent's card keeps updating after the turn that launched it.
+                } else if item.get("type").and_then(|t| t.as_str()) == Some("tool_call") && self.agents.contains_key(&agent_id) {
+                    // Background work (sub-agents, shells, workflows) keeps
+                    // updating its card after the turn that launched it, and
+                    // gets its final status even when no turn opens for it.
                     self.append_item(&agent_id, item);
                 }
             }

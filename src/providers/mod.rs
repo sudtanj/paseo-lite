@@ -40,8 +40,9 @@ pub enum ProviderEvent {
     /// TurnFailed. `resets_at` (unix seconds) when the provider said.
     LimitHit { agent_id: String, resets_at: Option<u64> },
     TurnCanceled { agent_id: String, reason: String },
-    /// Background sub-agents reported back: the Claude CLI runs a turn of its
-    /// own on their results, which the manager opens if none is running.
+    /// The Claude CLI produced output while no turn was open: it runs a turn
+    /// of its own (background work reported back), which the manager opens.
+    /// Sent once per such turn, before its first timeline item.
     BackgroundTurn { agent_id: String },
     /// Process-level exit (Claude) so the pool can free the slot.
     ProcessExited { agent_id: String, generation: u64 },

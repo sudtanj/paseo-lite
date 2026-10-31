@@ -41,6 +41,10 @@ pub struct StreamState {
     pub sub_cap: Arc<AtomicUsize>,
     /// Sub-agent launches the gate let through, and when.
     admitted: HashMap<String, Instant>,
+    /// Whether a turn is open on the daemon's side, shared with the pool
+    /// (set when it sends a prompt, cleared when the turn ends). Output
+    /// while it is clear is a turn the CLI runs of its own.
+    pub turn_open: Arc<AtomicBool>,
 }
 
 /// The `PreToolUse` hook callback id the daemon registers for Agent/Task
@@ -88,15 +92,16 @@ fn is_agent_tool(name: &str) -> bool {
 
 /// Does this successful tool result mean the work runs on in the background
 /// and reports back with a `<task-notification>`? Workflows always do, shell
-/// commands when asked to, sub-agents say so in their short launch answer
-/// (a foreground sub-agent's final report must not be taken for one).
+/// commands when asked to or when Bash moved a slow one there itself,
+/// sub-agents say so in their short launch answer (a foreground sub-agent's
+/// final report must not be taken for one).
 fn launched_in_background(name: &str, input: &Value, output: &str) -> bool {
     let asked = input.get("run_in_background").and_then(|v| v.as_bool()).unwrap_or(false);
     match name {
         "Workflow" => true,
-        "Bash" | "PowerShell" => asked || output.starts_with("Command running in background with ID:"),
+        "Bash" | "PowerShell" => asked || output.starts_with("Command running in background with ID:") || (output.starts_with("Command did not complete within its") && output.contains("moved to the background (ID:")),
         "Task" | "Agent" => {
-            if output.starts_with("Async agent launched") {
+            if output.starts_with("Async agent launched") || output.starts_with("Forked agent") {
                 return true;
             }
             // Forks, and sub-agents that run in the background by default,
@@ -120,11 +125,20 @@ fn s(v: &Value, key: &str) -> Option<String> {
 
 impl StreamState {
     pub fn new(agent_id: String, events: EventTx, stdin: mpsc::UnboundedSender<String>, interrupted: Arc<AtomicBool>, session_id: Option<String>) -> Self {
-        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new() }
+        StreamState { agent_id, events, stdin, interrupted, session_id, tools: HashMap::new(), streamed: HashSet::new(), current_message: None, context_tokens: None, limit_info: None, limit_refused: None, sub_limited: false, sub_logs: HashMap::new(), background: HashMap::new(), sub_active: Arc::default(), sub_cap: Arc::new(AtomicUsize::new(usize::MAX)), admitted: HashMap::new(), turn_open: Arc::default() }
     }
 
     fn emit(&self, ev: ProviderEvent) {
         let _ = self.events.send(ev);
+    }
+
+    /// The CLI produces output while no turn is open on the daemon's side:
+    /// it runs a turn of its own (background work reported back). Tell the
+    /// manager once, before the output, so it opens the turn and records it.
+    fn ensure_turn(&self) {
+        if !self.turn_open.swap(true, Ordering::SeqCst) {
+            self.emit(ProviderEvent::BackgroundTurn { agent_id: self.agent_id.clone() });
+        }
     }
 
     fn timeline(&self, item: Value) {
@@ -134,6 +148,8 @@ impl StreamState {
     pub fn handle_line(&mut self, line: &str) {
         let Ok(msg) = serde_json::from_str::<Value>(line) else { return };
         let is_sidechain = msg.get("parent_tool_use_id").map(|v| !v.is_null()).unwrap_or(false);
+        // Replayed history (on resume) is not the model working.
+        let replay = msg.get("isReplay").and_then(|v| v.as_bool()).unwrap_or(false);
         match msg.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "system" if s(&msg, "subtype").as_deref() == Some("compact_boundary") => {
                 let meta = msg.get("compact_metadata").or_else(|| msg.get("compactMetadata")).unwrap_or(&Value::Null);
@@ -157,13 +173,32 @@ impl StreamState {
                     }
                 }
             }
-            "stream_event" if !is_sidechain => self.handle_stream_event(msg.get("event").unwrap_or(&Value::Null)),
-            "assistant" if !is_sidechain => self.handle_assistant(&msg),
+            "stream_event" if !is_sidechain => {
+                if !replay {
+                    self.ensure_turn();
+                }
+                self.handle_stream_event(msg.get("event").unwrap_or(&Value::Null));
+            }
+            "assistant" if !is_sidechain => {
+                if !replay {
+                    self.ensure_turn();
+                }
+                self.handle_assistant(&msg);
+            }
             "assistant" => {
                 self.sub_limited |= is_limit_message(&msg);
                 self.handle_sidechain(&msg);
             }
-            "user" if !is_sidechain => self.handle_tool_results(&msg),
+            "user" if !is_sidechain => {
+                // Tool results and task notifications are the turn's own
+                // traffic; a plain text message is a prompt echoed back.
+                let content = msg.pointer("/message/content").unwrap_or(&Value::Null);
+                let results = content.as_array().map(|b| b.iter().any(|b| b.get("type").and_then(|t| t.as_str()).map(|t| t.ends_with("tool_result")).unwrap_or(false))).unwrap_or(false);
+                if results || content_text(content).contains("<task-notification>") {
+                    self.ensure_turn();
+                }
+                self.handle_tool_results(&msg);
+            }
             "rate_limit_event" => self.limit_info = msg.get("rate_limit_info").cloned(),
             "result" => self.handle_result(&msg),
             "control_request" => self.handle_control_request(&msg),
@@ -283,13 +318,13 @@ impl StreamState {
 
     /// Background work that reported back (`<task-notification>`): its cards
     /// get the final result. The CLI then runs a turn of its own on
-    /// them, which the manager is told to open.
+    /// them, which the manager is told to open (once, if not already).
     fn finish_background(&mut self, content: &Value) {
         let text = content_text(content);
         if !text.contains("<task-notification>") {
             return;
         }
-        self.emit(ProviderEvent::BackgroundTurn { agent_id: self.agent_id.clone() });
+        self.ensure_turn();
         for note in text.split("<task-notification>").skip(1) {
             let Some(id) = tag(note, "tool-use-id") else { continue };
             self.admitted.remove(&id);
@@ -364,6 +399,8 @@ impl StreamState {
 
     fn handle_result(&mut self, msg: &Value) {
         let agent_id = self.agent_id.clone();
+        // The turn is over: the next output starts one of the CLI's own.
+        self.turn_open.store(false, Ordering::SeqCst);
         if let Some(u) = msg.get("usage") {
             let usage = json!({
                 "inputTokens": u.get("input_tokens"),
@@ -601,10 +638,12 @@ pub fn question_answer(updated: Option<&Value>, original: &Value) -> Option<Valu
 mod tests {
     use super::*;
 
+    /// Feed lines to a reader whose daemon-side turn is open (a prompt was sent).
     fn run(lines: &[Value]) -> Vec<ProviderEvent> {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (stdin, _keep) = mpsc::unbounded_channel();
         let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        st.turn_open.store(true, Ordering::SeqCst);
         for line in lines {
             st.handle_line(&line.to_string());
         }
@@ -750,7 +789,7 @@ mod tests {
         let notified = json!({ "type": "user", "message": { "content": note } });
         let events = run(&[task.clone(), launched.clone(), done, bash.clone(), notified]);
         // The CLI acts on the notification in a turn of its own.
-        assert!(events.iter().any(|e| matches!(e, ProviderEvent::BackgroundTurn { .. })));
+        assert_eq!(events.iter().filter(|e| matches!(e, ProviderEvent::BackgroundTurn { .. })).count(), 1);
         let items = timeline(events);
         assert_eq!(items.len(), 4);
         // The launch answer is internal metadata: the card shows no log yet.
@@ -836,6 +875,86 @@ mod tests {
     }
 
     #[test]
+    fn output_while_idle_opens_a_turn_once() {
+        let kind = |e: &ProviderEvent| match e {
+            ProviderEvent::BackgroundTurn { .. } => "open",
+            ProviderEvent::Timeline { .. } => "item",
+            ProviderEvent::TurnCompleted { .. } => "done",
+            _ => "other",
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        // No prompt was sent, and no notification shows up: the CLI just starts working.
+        let lines = [
+            json!({ "type": "system", "subtype": "init", "session_id": "s1" }),
+            json!({ "type": "stream_event", "event": { "type": "message_start", "message": { "id": "m1" } } }),
+            json!({ "type": "stream_event", "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "Checking " } } }),
+            json!({ "type": "assistant", "message": { "id": "m1", "content": [{ "type": "text", "text": "Checking " }, { "type": "tool_use", "id": "toolu_1", "name": "Read", "input": { "file_path": "/tmp/out" } }] } }),
+            json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok" }] } }),
+            json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "The build passed." }] } }),
+            json!({ "type": "result", "subtype": "success", "result": "The build passed." }),
+        ];
+        for line in &lines {
+            st.handle_line(&line.to_string());
+        }
+        assert!(!st.turn_open.load(Ordering::SeqCst), "the result closes the turn");
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(kind(&ev));
+        }
+        // Opened once, before the first item (the streamed text is not
+        // repeated from the assistant message); items until the result.
+        assert_eq!(kinds, ["open", "item", "item", "item", "item", "done"]);
+
+        // The next output opens another; replayed history does not.
+        st.handle_line(&json!({ "type": "assistant", "isReplay": true, "message": { "content": [{ "type": "text", "text": "Old reply" }] } }).to_string());
+        st.handle_line(&json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "More" }] } }).to_string());
+        let mut kinds = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            kinds.push(kind(&ev));
+        }
+        assert_eq!(kinds, ["item", "open", "item"]);
+
+        // With a prompt sent by the daemon, nothing extra is opened.
+        let opened = run(&lines).into_iter().filter(|e| matches!(e, ProviderEvent::BackgroundTurn { .. })).count();
+        assert_eq!(opened, 0);
+    }
+
+    #[test]
+    fn background_shell_card_completes_on_its_notification_alone() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (stdin, _keep) = mpsc::unbounded_channel();
+        let mut st = StreamState::new("a1".into(), tx, stdin, Arc::new(AtomicBool::new(false)), Some("s1".into()));
+        st.turn_open.store(true, Ordering::SeqCst);
+        let lines = [
+            json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": "toolu_b", "name": "Bash", "input": { "command": "cargo test" } }] } }),
+            // Bash itself moved the slow command to the background.
+            json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": "toolu_b", "content": "Command did not complete within its 120000ms timeout and was moved to the background (ID: bg7). Output is being written to: /tmp/bg7.out" }] } }),
+            json!({ "type": "result", "subtype": "success", "result": "Running the tests." }),
+        ];
+        for line in &lines {
+            st.handle_line(&line.to_string());
+        }
+        assert!(st.sub_active.lock().unwrap().running);
+        while rx.try_recv().is_ok() {}
+        // Only the notification arrives (the CLI's own turn, if any, is lost).
+        let note = "<task-notification>\n<task-id>bg7</task-id>\n<tool-use-id>toolu_b</tool-use-id>\n<status>completed</status>\n<summary>Background command \"cargo test\" completed (exit code 0)</summary>\n</task-notification>";
+        st.handle_line(&json!({ "type": "user", "isSynthetic": true, "message": { "content": note } }).to_string());
+        assert!(!st.sub_active.lock().unwrap().running);
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        assert!(matches!(events[0], ProviderEvent::BackgroundTurn { .. }));
+        assert_eq!(events.len(), 2);
+        let ProviderEvent::Timeline { item, .. } = &events[1] else { panic!("a card") };
+        assert_eq!(item["callId"], "toolu_b");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["detail"]["output"], "Background command \"cargo test\" completed (exit code 0)");
+    }
+
+    #[test]
     fn foreground_results_are_not_taken_for_background_launches() {
         let call = |id: &str, name: &str, input: Value| json!({ "type": "assistant", "message": { "content": [{ "type": "tool_use", "id": id, "name": name, "input": input }] } });
         let result = |id: &str, text: &str| json!({ "type": "user", "message": { "content": [{ "type": "tool_result", "tool_use_id": id, "content": text }] } });
@@ -859,7 +978,11 @@ mod tests {
         // A fork's launch answer counts, whatever its wording.
         assert!(launched_in_background("Agent", &json!({ "subagent_type": "fork" }), "Fork started.\nagentId: f1"));
         assert!(launched_in_background("Agent", &json!({}), "Async agent launched successfully.\nagentId: a1"));
+        assert!(launched_in_background("Agent", &json!({ "subagent_type": "fork" }), &format!("Forked agent running in the background.\n{}", "x".repeat(2500))));
         assert!(!launched_in_background("Agent", &json!({ "subagent_type": "fork" }), &format!("The agent finished: {}", "x".repeat(400))));
+        // A command Bash moved to the background after its timeout reports back too.
+        assert!(launched_in_background("Bash", &json!({ "command": "make" }), "Command did not complete within its 120000ms timeout and was moved to the background (ID: bg1). Output is being written to: /tmp/bg1.out"));
+        assert!(!launched_in_background("Bash", &json!({ "command": "make" }), "Command did not complete within its 120000ms timeout and was killed."));
     }
 
     #[test]

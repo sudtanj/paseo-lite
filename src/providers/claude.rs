@@ -6,6 +6,9 @@
 //! - kept warm for `claude_idle` after a turn so follow-ups are instant,
 //!   and for as long as background sub-agents are still working in it,
 //! - then its stdin is closed and it exits, freeing all of its memory.
+//! When background work (sub-agents, shells, workflows) reports back between
+//! turns, the CLI runs a turn of its own: the stream reader notices output
+//! while the shared `busy` flag is clear and has the manager open a turn.
 //! At most `max_live` children run at once across all projects: the fixed
 //! `claude_max_live`, or the manager's auto capacity (one on a small machine).
 //! When the cap is hit the oldest idle child is evicted, or the prompt waits
@@ -31,7 +34,9 @@ use tokio::sync::{mpsc, oneshot};
 struct Proc {
     stdin: mpsc::UnboundedSender<String>,
     kill: Option<oneshot::Sender<()>>,
-    busy: bool,
+    /// A turn is open for it on the daemon's side; shared with its stream
+    /// reader, which opens one itself when the CLI starts a turn of its own.
+    busy: Arc<AtomicBool>,
     last_used: Instant,
     generation: u64,
     interrupted: Arc<AtomicBool>,
@@ -42,6 +47,10 @@ struct Proc {
 }
 
 impl Proc {
+    fn busy(&self) -> bool {
+        self.busy.load(Ordering::SeqCst)
+    }
+
     /// Idle between turns, but its background sub-agents are still working:
     /// stopping it would kill them.
     fn holding(&self) -> bool {
@@ -101,7 +110,7 @@ impl ClaudePool {
         if self.strained {
             return self.procs.len();
         }
-        self.procs.values().filter(|p| p.busy || !p.holding()).count()
+        self.procs.values().filter(|p| p.busy() || !p.holding()).count()
     }
 
     /// Change the process cap. Lowering it stops warm idle processes above
@@ -158,7 +167,7 @@ impl ClaudePool {
     /// Deliver a prompt. The caller guarantees the agent is not mid-turn.
     pub fn send(&mut self, spec: AgentSpec, text: String) -> SendOutcome {
         if let Some(p) = self.procs.get_mut(&spec.id) {
-            p.busy = true;
+            p.busy.store(true, Ordering::SeqCst);
             p.last_used = Instant::now();
             if p.stdin.send(Self::user_message(&text, &spec.session_id)).is_ok() {
                 return SendOutcome::Started;
@@ -172,7 +181,7 @@ impl ClaudePool {
         match self.spawn(&spec) {
             Ok(()) => {
                 let p = self.procs.get_mut(&spec.id).expect("just spawned");
-                p.busy = true;
+                p.busy.store(true, Ordering::SeqCst);
                 let _ = p.stdin.send(Self::user_message(&text, &spec.session_id));
                 SendOutcome::Started
             }
@@ -180,9 +189,14 @@ impl ClaudePool {
         }
     }
 
-    /// Stop every process that isn't running a turn. Returns how many.
+    /// Stop processes that aren't running a turn, to free memory. Plain idle
+    /// ones go first; those holding background sub-agents are only stopped
+    /// (killing them; their cards say so) when there was nothing else to free.
     pub fn release_idle(&mut self) -> usize {
-        let idle: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy).map(|(id, _)| id.clone()).collect();
+        let mut idle: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy() && !p.holding()).map(|(id, _)| id.clone()).collect();
+        if idle.is_empty() {
+            idle = self.procs.iter().filter(|(_, p)| !p.busy()).map(|(id, _)| id.clone()).collect();
+        }
         for id in &idle {
             self.stop(id);
         }
@@ -190,7 +204,7 @@ impl ClaudePool {
     }
 
     fn evict_one_idle(&mut self) -> bool {
-        let victim = self.procs.iter().filter(|(_, p)| !p.busy && !p.holding()).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
+        let victim = self.procs.iter().filter(|(_, p)| !p.busy() && !p.holding()).min_by_key(|(_, p)| p.last_used).map(|(id, _)| id.clone());
         match victim {
             Some(id) => {
                 self.stop(&id);
@@ -249,6 +263,7 @@ impl ClaudePool {
         let (in_tx, mut in_rx) = mpsc::unbounded_channel::<String>();
         let (kill_tx, kill_rx) = oneshot::channel::<()>();
         let interrupted = Arc::new(AtomicBool::new(false));
+        let busy = Arc::new(AtomicBool::new(false));
 
         if spec.session_id.is_none() {
             let _ = self.events.send(ProviderEvent::SessionStarted { agent_id: spec.id.clone(), session_id: session_id.clone() });
@@ -291,6 +306,7 @@ impl ClaudePool {
         let mut state = StreamState::new(spec.id.clone(), self.events.clone(), in_tx.clone(), interrupted.clone(), Some(session_id));
         let sub_active = state.sub_active.clone();
         state.sub_cap = self.sub_cap.clone();
+        state.turn_open = busy.clone();
         let events = self.events.clone();
         let agent_id = spec.id.clone();
         tokio::spawn(async move {
@@ -319,7 +335,7 @@ impl ClaudePool {
             let _ = events.send(ProviderEvent::ProcessExited { agent_id, generation });
         });
 
-        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy: false, last_used: Instant::now(), generation, interrupted, sub_active, restart: false });
+        self.procs.insert(spec.id.clone(), Proc { stdin: in_tx, kill: Some(kill_tx), busy, last_used: Instant::now(), generation, interrupted, sub_active, restart: false });
         Ok(())
     }
 
@@ -327,7 +343,7 @@ impl ClaudePool {
     pub fn turn_finished(&mut self, agent_id: &str) -> Vec<(AgentSpec, String)> {
         let restart = match self.procs.get_mut(agent_id) {
             Some(p) => {
-                p.busy = false;
+                p.busy.store(false, Ordering::SeqCst);
                 p.last_used = Instant::now();
                 p.restart
             }
@@ -388,7 +404,7 @@ impl ClaudePool {
     /// Model changes need a fresh process; the next prompt resumes the session.
     pub fn restart_on_next_prompt(&mut self, agent_id: &str) {
         let idle = match self.procs.get_mut(agent_id) {
-            Some(p) if p.busy => {
+            Some(p) if p.busy() => {
                 p.restart = true;
                 false
             }
@@ -427,7 +443,7 @@ impl ClaudePool {
     pub fn reap(&mut self) -> Vec<(AgentSpec, String)> {
         if !self.cfg.claude_keep_warm {
             let idle = self.cfg.claude_idle;
-            let stale: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy && !p.holding() && p.last_used.elapsed() >= idle).map(|(id, _)| id.clone()).collect();
+            let stale: Vec<String> = self.procs.iter().filter(|(_, p)| !p.busy() && !p.holding() && p.last_used.elapsed() >= idle).map(|(id, _)| id.clone()).collect();
             for id in stale {
                 crate::log!("claude idle for agent {id}; releasing process");
                 self.stop(&id);
@@ -436,11 +452,11 @@ impl ClaudePool {
         self.drain_waiting()
     }
 
-    /// The CLI started a turn of its own (background sub-agents reported
-    /// back). False when the agent's process is already gone.
+    /// The CLI started a turn of its own (background work reported back).
+    /// False when the agent's process is already gone.
     pub fn mark_busy(&mut self, agent_id: &str) -> bool {
         let Some(p) = self.procs.get_mut(agent_id) else { return false };
-        p.busy = true;
+        p.busy.store(true, Ordering::SeqCst);
         p.last_used = Instant::now();
         true
     }
