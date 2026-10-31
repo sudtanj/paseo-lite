@@ -42,7 +42,9 @@ const CPU_PRESSURE_HIGH: f64 = 80.0;
 /// Memory stalls at or above this are critical.
 const MEM_PRESSURE_CRITICAL: f64 = 40.0;
 /// Pressure below which the machine counts as calm enough to grow.
-const MEM_PRESSURE_CALM: f64 = 2.0;
+/// Well under HIGH: swap-ins from zram alone show as a few percent of
+/// stalls on a small VM, which shouldn't keep a second agent from starting.
+const MEM_PRESSURE_CALM: f64 = 5.0;
 const CPU_PRESSURE_CALM: f64 = 40.0;
 /// Share of wall time the container was held back by its CPU quota.
 const THROTTLE_HIGH: f64 = 0.5;

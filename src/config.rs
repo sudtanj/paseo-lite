@@ -160,7 +160,7 @@ impl Config {
             codex_max_active: crate::capacity::Mode::parse(env("PASEO_CODEX_MAX_ACTIVE").as_deref()),
             agent_mb: env("PASEO_AGENT_MB").and_then(|v| v.parse().ok()).unwrap_or(300).max(50),
             auto_max_agents: env("PASEO_AUTO_MAX_AGENTS").and_then(|v| v.parse().ok()).unwrap_or(8).max(1),
-            auto_stable: env_secs("PASEO_AUTO_STABLE_SECS", 60),
+            auto_stable: env_secs("PASEO_AUTO_STABLE_SECS", 20),
             codex_keep_warm: env_bool("PASEO_CODEX_KEEP_WARM").unwrap_or(true),
             agent_nice: env("PASEO_AGENT_NICE").and_then(|v| v.parse().ok()).unwrap_or(10).clamp(0, 19),
             agent_oom_score_adj: env("PASEO_AGENT_OOM_SCORE_ADJ").and_then(|v| v.parse().ok()).unwrap_or(500).clamp(0, 1000),
